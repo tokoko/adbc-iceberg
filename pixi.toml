@@ -6,6 +6,7 @@ platforms = ["linux-64"]
 [dependencies]
 python = ">=3.11"
 go = ">=1.24"
+rust = ">=1.85"
 clang-tools = ">=16"
 c-compiler = "*"
 cxx-compiler = "*"
@@ -17,9 +18,11 @@ pyiceberg = { version = ">=0.9.0", extras = ["s3"] }
 duckdb = ">=1.0.0"
 numpy = ">=1.26"
 datafusion = ">=52.0"
+adbc-drivers-dev = { git = "https://github.com/adbc-drivers/dev" }
 
-[tasks]
-generate = """export PATH=$CONDA_PREFIX/bin:$HOME/go/bin:$PATH && \
+# --- Go driver tasks ---
+[tasks.go-generate]
+cmd = """export PATH=$CONDA_PREFIX/bin:$HOME/go/bin:$PATH && \
   go install golang.org/x/tools/cmd/goimports@latest && \
   rm -rf pkg/iceberg && mkdir -p pkg/iceberg/arrow-adbc && \
   go run github.com/apache/arrow-adbc/go/adbc/pkg/gen \
@@ -30,5 +33,33 @@ generate = """export PATH=$CONDA_PREFIX/bin:$HOME/go/bin:$PATH && \
   chmod u+w pkg/iceberg/*.go pkg/iceberg/*.c pkg/iceberg/*.h && \
   cp $(go env GOMODCACHE)/github.com/apache/arrow-adbc/go/adbc@v1.11.0/drivermgr/arrow-adbc/adbc.h pkg/iceberg/arrow-adbc/adbc.h && \
   sed -i 's|../../drivermgr/arrow-adbc/adbc.h|arrow-adbc/adbc.h|g' pkg/iceberg/driver.go pkg/iceberg/utils.h"""
-build = { cmd = "go build -tags driverlib -o libadbc_driver_iceberg.so -buildmode=c-shared ./pkg/iceberg", depends-on = ["generate"] }
-test = "go test ./..."
+cwd = "go"
+
+[tasks.go-build]
+cmd = "go build -tags driverlib -o ../build/libadbc_driver_iceberg_go.so -buildmode=c-shared ./pkg/iceberg"
+cwd = "go"
+depends-on = ["go-generate"]
+
+[tasks.go-test]
+cmd = "go test ./..."
+cwd = "go"
+
+# --- Rust driver tasks ---
+[tasks.rust-build]
+cmd = "cargo build && cp target/debug/libadbc_driver_iceberg.so ../build/libadbc_driver_iceberg_rust.so"
+cwd = "rust"
+
+[tasks.rust-build-release]
+cmd = "cargo build --release && cp target/release/libadbc_driver_iceberg.so ../build/libadbc_driver_iceberg_rust.so"
+cwd = "rust"
+
+[tasks.rust-test]
+cmd = "cargo test"
+cwd = "rust"
+
+# --- Combined tasks ---
+[tasks.build]
+depends-on = ["go-build", "rust-build"]
+
+[tasks.test]
+depends-on = ["go-test", "rust-test"]

@@ -1,18 +1,25 @@
 # ADBC Iceberg Driver
 
-An [ADBC](https://arrow.apache.org/adbc/) driver for [Apache Iceberg](https://iceberg.apache.org/) tables, written in Go. It enables any ADBC-compatible query engine to read Iceberg tables through a standard Arrow-native interface.
+An [ADBC](https://arrow.apache.org/adbc/) driver for [Apache Iceberg](https://iceberg.apache.org/) tables, implemented in both Go and Rust. It enables any ADBC-compatible query engine to read Iceberg tables through a standard Arrow-native interface.
 
 The idea: instead of each engine (DuckDB, DataFusion, Spark, etc.) implementing its own Iceberg connector, they all speak ADBC and this driver handles the Iceberg complexity once.
 
-## Features
+## Two Implementations
 
-- **REST catalog** support with token/OAuth2 authentication
-- **Parquet** data file reading via [iceberg-go](https://github.com/apache/iceberg-go)
-- **Column projection** pushed down to Parquet column pruning
-- **Predicate pushdown** — WHERE clauses converted to Iceberg expressions for file/row-group skipping and vectorized row filtering
-- **Partitioned execution** via `ExecutePartitions` for distributed scan planning
-- **S3/GCS/Azure** storage via gocloud
-- **C shared library** (.so) loadable from Python, DuckDB, or any ADBC consumer
+| | Go | Rust |
+|---|---|---|
+| Iceberg library | [iceberg-go](https://github.com/apache/iceberg-go) | [iceberg-rust](https://github.com/apache/iceberg-rust) 0.9 |
+| Parquet reader | Arrow Go | parquet-rs |
+| S3 client | gocloud (AWS Go SDK) | opendal |
+| ADBC framework | [driverbase-go](https://github.com/adbc-drivers/driverbase-go) | [adbc_core](https://crates.io/crates/adbc_core) + [adbc_ffi](https://crates.io/crates/adbc_ffi) |
+| Catalog support | REST only | REST (+ Glue, HMS, SQL, S3 Tables available via iceberg-rust) |
+| Column projection | Yes | Yes |
+| Predicate pushdown | Row group stats + vectorized filter | Row group stats + page index + row filter |
+| Partitioned execution | Broken (re-reads all files per partition) | Correct (reads only assigned file) |
+| Catalog enumeration | GetObjects, GetTableSchema, GetTableTypes | Not yet implemented |
+| Statement options | Snapshot ID, time travel, branch, batch size | Not yet implemented |
+
+Both produce identical Arrow output and are loadable from Python, DuckDB, or any ADBC consumer.
 
 ## Quick Start
 
@@ -23,7 +30,7 @@ pixi install
 # Start local Iceberg catalog (REST + MinIO)
 docker compose up -d
 
-# Build the driver
+# Build both drivers
 pixi run build
 
 # Seed test data (5M rows)
@@ -41,8 +48,9 @@ pixi run python benchmark.py
 ```python
 import adbc_driver_manager.dbapi
 
+# Either driver works — same interface, same options
 conn = adbc_driver_manager.dbapi.connect(
-    driver="./libadbc_driver_iceberg.so",
+    driver="./build/libadbc_driver_iceberg_rust.so",  # or _go.so
     entrypoint="AdbcDriverIcebergInit",
     db_kwargs={
         "uri": "http://localhost:8181",
@@ -66,7 +74,7 @@ INSTALL adbc_scanner FROM community;
 LOAD adbc_scanner;
 
 SELECT adbc_connect({
-    'driver': './libadbc_driver_iceberg.so',
+    'driver': './build/libadbc_driver_iceberg_rust.so',
     'entrypoint': 'AdbcDriverIcebergInit',
     'uri': 'http://localhost:8181',
     'adbc.iceberg.catalog.name': 'rest',
@@ -82,20 +90,20 @@ SELECT * FROM adbc_scan(0, 'SELECT * FROM default.my_table');
 
 ### Database Options
 
-| Option | Description |
-|---|---|
-| `uri` | REST catalog URI |
-| `adbc.iceberg.catalog.name` | Catalog name (default: `"default"`) |
-| `adbc.iceberg.auth.token` | Static bearer token |
-| `adbc.iceberg.auth.credential` | OAuth2 client credentials (`clientID:clientSecret`) |
-| `adbc.iceberg.auth.scope` | OAuth2 scope |
-| `adbc.iceberg.auth.uri` | Custom token endpoint URL |
-| `adbc.iceberg.s3.endpoint` | S3-compatible endpoint URL |
-| `adbc.iceberg.s3.region` | AWS region |
-| `adbc.iceberg.s3.access_key` | S3 access key ID |
-| `adbc.iceberg.s3.secret_key` | S3 secret access key |
+| Option | Description | Go | Rust |
+|---|---|---|---|
+| `uri` | REST catalog URI | Yes | Yes |
+| `adbc.iceberg.catalog.name` | Catalog name (default: `"default"`) | Yes | Yes |
+| `adbc.iceberg.auth.token` | Static bearer token | Yes | — |
+| `adbc.iceberg.auth.credential` | OAuth2 client credentials | Yes | — |
+| `adbc.iceberg.auth.scope` | OAuth2 scope | Yes | — |
+| `adbc.iceberg.auth.uri` | Custom token endpoint URL | Yes | — |
+| `adbc.iceberg.s3.endpoint` | S3-compatible endpoint URL | Yes | Yes |
+| `adbc.iceberg.s3.region` | AWS region | Yes | Yes |
+| `adbc.iceberg.s3.access_key` | S3 access key ID | Yes | Yes |
+| `adbc.iceberg.s3.secret_key` | S3 secret access key | Yes | Yes |
 
-### Statement Options
+### Statement Options (Go driver only)
 
 | Option | Description |
 |---|---|
@@ -107,72 +115,43 @@ SELECT * FROM adbc_scan(0, 'SELECT * FROM default.my_table');
 
 ## SQL Support
 
-The driver accepts a restricted SQL subset:
+Both drivers accept a restricted SQL subset:
 
 ```sql
 SELECT <columns | *> FROM [schema.]<table> [WHERE <filter>]
 ```
 
-Supported WHERE operators: `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `IN`, `NOT IN`, `IS NULL`, `IS NOT NULL`, `BETWEEN`, `AND`, `OR`, `NOT`, parentheses.
+Supported WHERE operators: `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `IS NULL`, `IS NOT NULL`, `AND`, `OR`, `NOT`, parentheses. The Go driver additionally supports `IN`, `NOT IN`, `BETWEEN`.
 
 ## Benchmarks
 
-5,000,000 rows across 5 Parquet files, unpartitioned table, reading from a local REST catalog + MinIO.
+5,000,000 rows across 5 Parquet files, unpartitioned table, reading from a local REST catalog + MinIO. PyIceberg included as a baseline (same iceberg-rust/parquet-rs stack, no ADBC overhead).
 
-### Full Table Scan
+```
+Engine                         full scan    projection    id < 100    name=alice    proj+pred
+─────────────────────────────  ─────────    ──────────    ────────    ──────────    ─────────
+DuckDB Iceberg (built-in)        0.57s        0.24s        0.08s        0.25s        0.07s
+ADBC Iceberg (Go)                0.21s        0.14s        0.09s        0.79s        0.07s
+ADBC Iceberg (Rust)              0.41s        0.26s        0.08s        0.44s        0.07s
+PyIceberg (baseline)             0.17s        0.11s        0.08s        0.18s        0.06s
+DuckDB adbc_scan() Go            0.78s        0.54s        0.17s        1.65s        0.17s
+DuckDB adbc_scan() Rust          0.62s        0.42s        0.12s        0.69s        0.13s
+DataFusion + ADBC Go             0.26s        0.17s        0.10s        0.86s        0.08s
+Partitioned Go (5x)              1.31s           —            —            —            —
+Partitioned Rust (5x)            0.44s           —            —            —            —
+```
 
-| Engine | Time | Rows |
-|---|---|---|
-| DataFusion + ADBC Iceberg | 0.20s | 5,000,000 |
-| **ADBC Iceberg** | **0.23s** | 5,000,000 |
-| DuckDB Iceberg (built-in) | 0.35s | 5,000,000 |
-| DuckDB adbc_scan() + ADBC Iceberg | 0.59s | 5,000,000 |
+### Key Findings
 
-The ADBC driver and DataFusion are fastest because Arrow batches flow through with no format conversion. DuckDB's built-in Iceberg extension must convert between DuckDB vectors and Arrow at the Python boundary. DuckDB's `adbc_scan()` pays for two conversions (Arrow → DuckDB → Arrow).
+**Full scan**: Go (0.21s) beats Rust (0.41s). Both use Arrow-native streaming, but gocloud's S3 client (AWS Go SDK) is faster than opendal at bulk reads. Raw benchmarking confirms opendal reads bytes 2.8x slower than `object_store` — there is an [active PR](https://github.com/apache/iceberg-rust/pull/2257) to add `object_store` as an alternative storage backend for iceberg-rust.
 
-### Column Projection (`SELECT id, name`)
+**Predicate pushdown (`name='alice'`)**: Rust (0.44s) beats Go (0.79s) by nearly 2x. parquet-rs supports page index filtering and dictionary filtering, skipping pages that can't match. Arrow Go's Parquet reader decodes all pages then filters with `compute.Filter`.
 
-| Engine | Time | Rows |
-|---|---|---|
-| DataFusion + ADBC Iceberg | 0.15s | 5,000,000 |
-| DuckDB Iceberg (built-in) | 0.20s | 5,000,000 |
-| ADBC Iceberg | 0.21s | 5,000,000 |
-| DuckDB adbc_scan() | 0.39s | 5,000,000 |
+**Highly selective (`id < 100`)**: All engines are comparable (~0.07-0.09s) because row group statistics pruning skips most data regardless of reader implementation.
 
-Projection is pushed down to Parquet column pruning in all engines.
+**Partitioned execution**: Rust reads exactly 5M rows (correct — 1M per partition). Go reads 25M rows (broken — each `ReadPartition` re-reads all files due to iceberg-go's unexported `arrowScan.GetRecords`).
 
-### Predicate Pushdown — Highly Selective (`WHERE id < 100`)
-
-| Engine | Time | Rows |
-|---|---|---|
-| DuckDB Iceberg (built-in) | 0.06s | 100 |
-| ADBC Iceberg | 0.07s | 100 |
-| DataFusion + ADBC Iceberg | 0.10s | 100 |
-| DuckDB adbc_scan() | 0.20s | 100 |
-
-All engines benefit from row group statistics pruning. Performance is comparable when most data is skipped.
-
-### Predicate Pushdown — Moderate Selectivity (`WHERE name = 'alice'`)
-
-| Engine | Time | Rows |
-|---|---|---|
-| DuckDB Iceberg (built-in) | 0.25s | 1,000,000 |
-| ADBC Iceberg | 0.71s | 1,000,000 |
-| DataFusion + ADBC Iceberg | 0.73s | 1,000,000 |
-| DuckDB adbc_scan() | 1.54s | 1,000,000 |
-
-DuckDB is ~3x faster here. The table is unpartitioned and every row group contains all 5 name values, so no row groups can be skipped. DuckDB pushes string equality into its Parquet reader at the page level (page index filtering, dictionary filtering), avoiding full decode of non-matching pages. iceberg-go's Arrow Parquet reader decodes all pages first, then applies a vectorized Arrow `compute.Filter` — correct, but slower. This is an Arrow Go Parquet reader limitation, not a driver issue. iceberg-rust does not have this limitation as it uses parquet-rs which supports page-level predicate pushdown.
-
-### Projection + Predicate (`SELECT id, value WHERE id < 1000`)
-
-| Engine | Time | Rows |
-|---|---|---|
-| DataFusion + ADBC Iceberg | 0.08s | 1,000 |
-| ADBC Iceberg | 0.09s | 1,000 |
-| DuckDB Iceberg (built-in) | 0.13s | 1,000 |
-| DuckDB adbc_scan() | 0.17s | 1,000 |
-
-Combined projection and predicate pushdown. All engines perform well when the result set is small.
+**DuckDB adbc_scan()**: Rust variant is consistently faster than Go, especially on filtered queries (0.69s vs 1.65s for `name='alice'`).
 
 ## Architecture
 
@@ -182,48 +161,58 @@ Query Engine (DuckDB / DataFusion / Python / ...)
     ▼
 ADBC Interface (C Data Interface)
     │
-    ▼
-┌─────────────────────────────────────────┐
-│  ADBC Iceberg Driver (this project)     │
-│                                         │
-│  SQL Parser ─► Iceberg Expressions      │
-│  REST Catalog Client                    │
-│  Scan Planning (snapshot, partitions)   │
-│  Parquet → Arrow RecordBatch streaming  │
-└─────────────────────────────────────────┘
-    │
-    ▼
+    ├──────────────────────┐
+    ▼                      ▼
+┌──────────────┐   ┌──────────────┐
+│  Go Driver   │   │ Rust Driver  │
+│  iceberg-go  │   │ iceberg-rust │
+│  gocloud S3  │   │  opendal S3  │
+│  driverbase  │   │  adbc_ffi    │
+└──────────────┘   └──────────────┘
+    │                      │
+    ▼                      ▼
 Iceberg REST Catalog ──► S3 / GCS / Azure
 ```
 
 ## Known Limitations
 
-- **Read-only** — no write/append support yet
-- **REST catalog only** — no Hive, Glue, or JDBC catalog
-- **Parquet only** — no ORC or Avro data files
-- **ReadPartition re-reads all files** — `ExecutePartitions` correctly plans per-file partitions, but `ReadPartition` currently re-reads the entire table for each partition because iceberg-go doesn't expose a public API to read specific `FileScanTask`s ([upstream issue needed](https://github.com/apache/iceberg-go))
-- **No page-level predicate pushdown** — Arrow Go's Parquet reader lacks page index and dictionary filtering, making moderate-selectivity string predicates slower than engines with page-level pushdown (DuckDB, parquet-rs)
+### Go Driver
+- **ReadPartition re-reads all files** — `ExecutePartitions` correctly plans per-file partitions, but `ReadPartition` re-reads the entire table because iceberg-go doesn't expose a public API to read specific `FileScanTask`s
+- **No page-level predicate pushdown** — Arrow Go's Parquet reader lacks page index and dictionary filtering
+
+### Rust Driver
+- **No catalog enumeration** — `GetObjects`, `GetTableSchema`, `GetTableTypes` not yet implemented
+- **No statement options** — snapshot ID, time travel, branch not yet wired up
+- **opendal S3 throughput** — 2.8x slower than `object_store` for raw reads; pending [upstream fix](https://github.com/apache/iceberg-rust/pull/2257)
+- **Partitioned execution re-plans** — `ReadPartition` re-loads the table and re-plans files (filtering by path) because `FileScanTask` [cannot be fully serialized](https://github.com/apache/iceberg-rust/issues/2220)
+
+### Both
+- **Read-only** — no write/append support
+- **REST catalog only** (Rust could support Glue, HMS, SQL via iceberg-rust crates)
+- **Parquet only** — no ORC or Avro
 
 ## Project Structure
 
 ```
-├── driver.go           # Driver — creates Database instances
-├── database.go         # Database — REST catalog client, auth, S3 config
-├── connection.go       # Connection — catalog enumeration, schema, ReadPartition
-├── statement.go        # Statement — SQL parsing, scan, predicate conversion
-├── partition.go        # Partition descriptors (JSON), ExecutePartitions/Query
-├── reader.go           # iter.Seq2[RecordBatch] → array.RecordReader adapter
-├── options.go          # Option key constants
-├── sqlparser/          # Restricted SQL parser (hand-rolled recursive descent)
-│   ├── ast.go          # AST types
-│   ├── lexer.go        # Tokenizer
-│   ├── parser.go       # Parser
-│   └── parser_test.go  # 22 tests
-├── pkg/iceberg/        # Generated C shared library export (via ADBC pkg/gen)
-├── docker-compose.yml  # Local REST catalog + MinIO
-├── pixi.toml           # Dependencies and build tasks
-├── benchmark.py        # Multi-engine benchmark suite
-├── example.py          # Basic Python usage example
-├── seed.py             # Seed small test table
-└── seed_large.py       # Seed 5M row benchmark table
+├── go/                     # Go driver
+│   ├── driver.go           # Driver — creates Database instances
+│   ├── database.go         # Database — REST catalog client, auth, S3 config
+│   ├── connection.go       # Connection — catalog enumeration, schema, ReadPartition
+│   ├── statement.go        # Statement — SQL parsing, scan, predicate conversion
+│   ├── partition.go        # Partition descriptors, ExecutePartitions/Query
+│   ├── reader.go           # RecordBatch iterator → RecordReader adapter
+│   ├── options.go          # Option key constants
+│   ├── sqlparser/          # Restricted SQL parser (hand-rolled recursive descent)
+│   └── pkg/iceberg/        # Generated C shared library export
+├── rust/                   # Rust driver
+│   ├── src/lib.rs          # Driver, Database, Connection, Statement
+│   ├── src/sqlparser.rs    # Restricted SQL parser
+│   ├── examples/           # Direct benchmarks (no ADBC)
+│   └── Cargo.toml
+├── docker-compose.yml      # Local REST catalog + MinIO
+├── pixi.toml               # Dependencies and build tasks
+├── benchmark.py            # Multi-engine benchmark suite
+├── example.py              # Python usage example
+├── seed.py                 # Seed small test table
+└── seed_large.py           # Seed 5M row benchmark table
 ```
