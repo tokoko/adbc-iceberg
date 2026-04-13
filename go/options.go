@@ -8,6 +8,7 @@ const (
 // Iceberg-specific database option keys.
 const (
 	OptionKeyCatalogName    = "adbc.iceberg.catalog.name"
+	OptionKeyWarehouse      = "adbc.iceberg.warehouse"
 	OptionKeyAuthToken      = "adbc.iceberg.auth.token"
 	OptionKeyAuthCredential = "adbc.iceberg.auth.credential"
 	OptionKeyAuthScope      = "adbc.iceberg.auth.scope"

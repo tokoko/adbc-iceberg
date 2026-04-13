@@ -18,6 +18,7 @@ type database struct {
 
 	uri         string
 	catalogName string
+	warehouse   string
 	authToken   string
 	credential  string
 	authScope   string
@@ -52,6 +53,8 @@ func (db *database) SetOption(key, value string) error {
 		db.uri = value
 	case OptionKeyCatalogName:
 		db.catalogName = value
+	case OptionKeyWarehouse:
+		db.warehouse = value
 	case OptionKeyAuthToken:
 		db.authToken = value
 	case OptionKeyAuthCredential:
@@ -144,6 +147,10 @@ func (db *database) openCatalog(ctx context.Context) (catalog.Catalog, error) {
 	}
 	if len(props) > 0 {
 		opts = append(opts, rest.WithAdditionalProps(props))
+	}
+
+	if db.warehouse != "" {
+		opts = append(opts, rest.WithWarehouseLocation(db.warehouse))
 	}
 
 	return rest.NewCatalog(ctx, db.catalogName, db.uri, opts...)

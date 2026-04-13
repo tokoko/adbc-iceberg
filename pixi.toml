@@ -19,6 +19,7 @@ duckdb = ">=1.0.0"
 numpy = ">=1.26"
 datafusion = ">=52.0"
 adbc-drivers-dev = { git = "https://github.com/adbc-drivers/dev" }
+deltalake = ">=1.5.0, <2"
 
 # --- Go driver tasks ---
 [tasks.go-generate]
@@ -57,9 +58,22 @@ cwd = "rust"
 cmd = "cargo test"
 cwd = "rust"
 
+# --- Polaris driver tasks ---
+[tasks.polaris-build]
+cmd = "cargo build && cp target/debug/libadbc_driver_polaris.so ../build/libadbc_driver_polaris.so"
+cwd = "polaris"
+
+[tasks.polaris-build-release]
+cmd = "cargo build --release && cp target/release/libadbc_driver_polaris.so ../build/libadbc_driver_polaris.so"
+cwd = "polaris"
+
+[tasks.polaris-test]
+cmd = "cargo test"
+cwd = "polaris"
+
 # --- Combined tasks ---
 [tasks.build]
-depends-on = ["go-build", "rust-build"]
+depends-on = ["go-build", "rust-build", "polaris-build"]
 
 [tasks.test]
-depends-on = ["go-test", "rust-test"]
+depends-on = ["go-test", "rust-test", "polaris-test"]

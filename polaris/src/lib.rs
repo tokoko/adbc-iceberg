@@ -22,22 +22,13 @@ use iceberg::{Catalog, CatalogBuilder};
 use iceberg_catalog_rest::RestCatalogBuilder;
 use iceberg_storage_opendal::OpenDalStorageFactory;
 
+mod auth;
+mod delta_reader;
+mod polaris_api;
+mod s3_config;
 mod sqlparser;
 
-use serde::{Deserialize, Serialize};
-
-/// Partition descriptor — serialized as JSON in ExecutePartitions,
-/// deserialized in ReadPartition. We store the query + task file path
-/// so read_partition can re-plan and filter to the specific file.
-#[derive(Serialize, Deserialize)]
-struct PartitionDescriptor {
-    namespace: String,
-    table_name: String,
-    /// The SQL query to re-execute for this partition.
-    query: String,
-    /// The data file path — used to filter planned tasks to just this one.
-    data_file_path: String,
-}
+use s3_config::S3Config;
 
 // ---------------------------------------------------------------------------
 // Error helpers
@@ -47,7 +38,7 @@ struct PartitionDescriptor {
 pub struct ErrorHelper {}
 
 impl driverbase::error::ErrorHelper for ErrorHelper {
-    const NAME: &'static str = "iceberg";
+    const NAME: &'static str = "polaris";
 }
 
 impl ErrorHelper {
@@ -81,13 +72,13 @@ impl Runtime {
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
-pub struct IcebergDriver {}
+pub struct PolarisDriver {}
 
-impl Driver for IcebergDriver {
-    type DatabaseType = IcebergDatabase;
+impl Driver for PolarisDriver {
+    type DatabaseType = PolarisDatabase;
 
     fn new_database(&mut self) -> Result<Self::DatabaseType> {
-        Ok(IcebergDatabase {
+        Ok(PolarisDatabase {
             opts: HashMap::new(),
         })
     }
@@ -108,11 +99,11 @@ impl Driver for IcebergDriver {
 // Database
 // ---------------------------------------------------------------------------
 
-pub struct IcebergDatabase {
+pub struct PolarisDatabase {
     opts: HashMap<String, String>,
 }
 
-impl IcebergDatabase {
+impl PolarisDatabase {
     fn opt(&self, key: &str) -> Option<&str> {
         self.opts.get(key).map(|s| s.as_str())
     }
@@ -126,28 +117,17 @@ impl IcebergDatabase {
         })
     }
 
-    fn build_catalog_props(&self) -> Result<HashMap<String, String>> {
-        let mut props = HashMap::new();
-        props.insert("uri".to_string(), self.require_opt("uri")?.to_string());
-
-        let mappings = [
-            ("adbc.iceberg.warehouse", "warehouse"),
-            ("adbc.iceberg.s3.endpoint", "s3.endpoint"),
-            ("adbc.iceberg.s3.region", "s3.region"),
-            ("adbc.iceberg.s3.access_key", "s3.access-key-id"),
-            ("adbc.iceberg.s3.secret_key", "s3.secret-access-key"),
-        ];
-        for (adbc_key, iceberg_key) in mappings {
-            if let Some(v) = self.opt(adbc_key) {
-                props.insert(iceberg_key.to_string(), v.to_string());
-            }
+    fn s3_config(&self) -> S3Config {
+        S3Config {
+            endpoint: self.opt("adbc.polaris.s3.endpoint").map(|s| s.to_string()),
+            region: self.opt("adbc.polaris.s3.region").map(|s| s.to_string()),
+            access_key: self.opt("adbc.polaris.s3.access_key").map(|s| s.to_string()),
+            secret_key: self.opt("adbc.polaris.s3.secret_key").map(|s| s.to_string()),
         }
-
-        Ok(props)
     }
 }
 
-impl Optionable for IcebergDatabase {
+impl Optionable for PolarisDatabase {
     type Option = OptionDatabase;
 
     fn set_option(&mut self, key: Self::Option, value: OptionValue) -> Result<()> {
@@ -180,16 +160,52 @@ impl Optionable for IcebergDatabase {
     }
 }
 
-impl Database for IcebergDatabase {
-    type ConnectionType = IcebergConnection;
+impl Database for PolarisDatabase {
+    type ConnectionType = PolarisConnection;
 
     fn new_connection(&self) -> Result<Self::ConnectionType> {
-        let props = self.build_catalog_props()?;
-        let name = self.opt("adbc.iceberg.catalog.name").unwrap_or("rest").to_string();
+        let base_url = self.require_opt("uri")?.to_string();
+        let warehouse = self.opt("adbc.polaris.warehouse").unwrap_or("rest").to_string();
+        let scope = self.opt("adbc.polaris.scope").unwrap_or("PRINCIPAL_ROLE:ALL").to_string();
+        let s3_config = self.s3_config();
 
         let runtime = Arc::new(Runtime::new().map_err(|e| {
             Error::with_message_and_status(format!("failed to create runtime: {e}"), Status::Internal)
         })?);
+
+        // Acquire OAuth2 token if credentials are provided
+        let credential = self.opt("adbc.polaris.credential");
+        let token = if let Some(cred) = credential {
+            let parts: Vec<&str> = cred.splitn(2, ':').collect();
+            if parts.len() != 2 {
+                return Err(Error::with_message_and_status(
+                    "credential must be in 'client_id:client_secret' format",
+                    Status::InvalidArguments,
+                ));
+            }
+            let token = runtime
+                .block_on(auth::acquire_token(&base_url, parts[0], parts[1], &scope))
+                .map_err(|e| Error::with_message_and_status(
+                    format!("OAuth2 token acquisition failed: {e}"),
+                    Status::IO,
+                ))?;
+            Some(token)
+        } else {
+            None
+        };
+
+        // Build Iceberg REST catalog
+        let catalog_uri = format!("{base_url}/api/catalog");
+        let mut props = HashMap::new();
+        props.insert("uri".to_string(), catalog_uri);
+        props.insert("warehouse".to_string(), warehouse.clone());
+        if let Some(ref cred) = credential {
+            props.insert("credential".to_string(), cred.to_string());
+        }
+        props.insert("scope".to_string(), scope);
+        for (k, v) in s3_config.to_iceberg_props() {
+            props.insert(k, v);
+        }
 
         let storage_factory: Arc<dyn StorageFactory> = Arc::new(OpenDalStorageFactory::S3 {
             configured_scheme: "s3".to_string(),
@@ -200,13 +216,35 @@ impl Database for IcebergDatabase {
             .block_on(
                 RestCatalogBuilder::default()
                     .with_storage_factory(storage_factory)
-                    .load(name, props),
+                    .load(warehouse.clone(), props),
             )
             .map_err(|e| ErrorHelper::from_iceberg(e).to_adbc())?;
 
-        Ok(IcebergConnection {
+        // Build HTTP client for Generic Tables API
+        let mut http_builder = reqwest::Client::builder();
+        if let Some(ref token) = token {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                    .map_err(|e| Error::with_message_and_status(
+                        format!("invalid token: {e}"),
+                        Status::Internal,
+                    ))?,
+            );
+            http_builder = http_builder.default_headers(headers);
+        }
+        let http_client = http_builder.build().map_err(|e| {
+            Error::with_message_and_status(format!("failed to create HTTP client: {e}"), Status::Internal)
+        })?;
+
+        Ok(PolarisConnection {
             runtime,
             catalog: Arc::new(catalog),
+            http_client,
+            base_url,
+            warehouse,
+            s3_config,
         })
     }
 
@@ -226,12 +264,16 @@ impl Database for IcebergDatabase {
 // Connection
 // ---------------------------------------------------------------------------
 
-pub struct IcebergConnection {
+pub struct PolarisConnection {
     runtime: Arc<Runtime>,
     catalog: Arc<dyn Catalog>,
+    http_client: reqwest::Client,
+    base_url: String,
+    warehouse: String,
+    s3_config: S3Config,
 }
 
-impl Optionable for IcebergConnection {
+impl Optionable for PolarisConnection {
     type Option = OptionConnection;
     fn set_option(&mut self, key: Self::Option, _value: OptionValue) -> Result<()> {
         match key.as_ref() {
@@ -253,13 +295,17 @@ impl Optionable for IcebergConnection {
     }
 }
 
-impl Connection for IcebergConnection {
-    type StatementType = IcebergStatement;
+impl Connection for PolarisConnection {
+    type StatementType = PolarisStatement;
 
     fn new_statement(&mut self) -> Result<Self::StatementType> {
-        Ok(IcebergStatement {
+        Ok(PolarisStatement {
             runtime: self.runtime.clone(),
             catalog: self.catalog.clone(),
+            http_client: self.http_client.clone(),
+            base_url: self.base_url.clone(),
+            warehouse: self.warehouse.clone(),
+            s3_config: self.s3_config.clone(),
             sql_query: None,
         })
     }
@@ -277,62 +323,8 @@ impl Connection for IcebergConnection {
     fn get_table_types(&self) -> Result<impl RecordBatchReader + Send> {
         Err::<BatchReader, _>(ErrorHelper::not_implemented().message("get_table_types").to_adbc())
     }
-    fn read_partition(&self, partition: impl AsRef<[u8]>) -> Result<impl RecordBatchReader + Send> {
-        let descriptor: PartitionDescriptor = serde_json::from_slice(partition.as_ref())
-            .map_err(|e| Error::with_message_and_status(
-                format!("invalid partition descriptor: {e}"), Status::InvalidArguments,
-            ))?;
-
-        let parsed = sqlparser::parse(&descriptor.query).map_err(|e| {
-            Error::with_message_and_status(format!("unsupported SQL: {e}"), Status::InvalidArguments)
-        })?;
-
-        let table = load_table(
-            &self.runtime, self.catalog.as_ref(),
-            &descriptor.namespace, &descriptor.table_name,
-        )?;
-
-        let (schema, stream) = self.runtime.block_on(async {
-            let mut builder = table.scan();
-            if !parsed.select_all {
-                builder = builder.select(parsed.columns.iter().map(|s| s.as_str()));
-            }
-            if let Some(ref where_expr) = parsed.where_clause {
-                if let Ok(pred) = convert_predicate(where_expr) {
-                    builder = builder.with_filter(pred);
-                }
-            }
-
-            let scan = builder.build().map_err(|e| ErrorHelper::from_iceberg(e).to_adbc())?;
-
-            // Plan all files, then filter to just the one matching our descriptor.
-            use futures::TryStreamExt;
-            let tasks: Vec<iceberg::scan::FileScanTask> = scan
-                .plan_files()
-                .await
-                .map_err(|e| ErrorHelper::from_iceberg(e).to_adbc())?
-                .try_collect()
-                .await
-                .map_err(|e| ErrorHelper::from_iceberg(e).to_adbc())?;
-
-            let matching: Vec<_> = tasks
-                .into_iter()
-                .filter(|t| t.data_file_path == descriptor.data_file_path)
-                .collect();
-
-            let file_io = table.file_io().clone();
-            let reader = iceberg::arrow::ArrowReaderBuilder::new(file_io).build();
-            let task_stream = futures::stream::iter(matching.into_iter().map(Ok));
-            let batch_stream = reader.read(Box::pin(task_stream))
-                .map_err(|e| ErrorHelper::from_iceberg(e).to_adbc())?;
-
-            let schema = iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
-                .map_err(|e| ErrorHelper::from_iceberg(e).to_adbc())?;
-
-            Ok::<_, Error>((schema, batch_stream))
-        })?;
-
-        Ok(StreamingReader::new(Arc::new(schema), stream, self.runtime.clone()))
+    fn read_partition(&self, _partition: impl AsRef<[u8]>) -> Result<impl RecordBatchReader + Send> {
+        Err::<BatchReader, _>(ErrorHelper::not_implemented().message("read_partition").to_adbc())
     }
     fn get_statistic_names(&self) -> Result<impl RecordBatchReader + Send> {
         Err::<BatchReader, _>(ErrorHelper::not_implemented().message("get_statistic_names").to_adbc())
@@ -348,13 +340,17 @@ impl Connection for IcebergConnection {
 // Statement
 // ---------------------------------------------------------------------------
 
-pub struct IcebergStatement {
+pub struct PolarisStatement {
     runtime: Arc<Runtime>,
     catalog: Arc<dyn Catalog>,
+    http_client: reqwest::Client,
+    base_url: String,
+    warehouse: String,
+    s3_config: S3Config,
     sql_query: Option<String>,
 }
 
-fn load_table(runtime: &Runtime, catalog: &dyn Catalog, namespace: &str, table_name: &str) -> Result<Table> {
+fn load_iceberg_table(runtime: &Runtime, catalog: &dyn Catalog, namespace: &str, table_name: &str) -> Result<Table> {
     runtime.block_on(async {
         let ident = iceberg::TableIdent::new(
             iceberg::NamespaceIdent::new(namespace.to_string()),
@@ -364,7 +360,6 @@ fn load_table(runtime: &Runtime, catalog: &dyn Catalog, namespace: &str, table_n
     })
 }
 
-/// Convert parsed WHERE AST to iceberg Predicate.
 fn convert_predicate(expr: &sqlparser::Expr) -> Result<Predicate> {
     match expr {
         sqlparser::Expr::Binary { column, op, value } => {
@@ -379,12 +374,8 @@ fn convert_predicate(expr: &sqlparser::Expr) -> Result<Predicate> {
                 sqlparser::BinaryOp::Gte => r.greater_than_or_equal_to(d),
             })
         }
-        sqlparser::Expr::And(left, right) => {
-            Ok(convert_predicate(left)?.and(convert_predicate(right)?))
-        }
-        sqlparser::Expr::Or(left, right) => {
-            Ok(convert_predicate(left)?.or(convert_predicate(right)?))
-        }
+        sqlparser::Expr::And(left, right) => Ok(convert_predicate(left)?.and(convert_predicate(right)?)),
+        sqlparser::Expr::Or(left, right) => Ok(convert_predicate(left)?.or(convert_predicate(right)?)),
         sqlparser::Expr::Not(inner) => Ok(convert_predicate(inner)?.negate()),
         sqlparser::Expr::IsNull(col) => Ok(Reference::new(col).is_null()),
         sqlparser::Expr::IsNotNull(col) => Ok(Reference::new(col).is_not_null()),
@@ -400,7 +391,64 @@ fn convert_datum(val: &sqlparser::LiteralValue) -> Result<Datum> {
     }
 }
 
-impl Optionable for IcebergStatement {
+fn execute_iceberg(
+    runtime: &Arc<Runtime>,
+    catalog: &Arc<dyn Catalog>,
+    parsed: &sqlparser::SelectStatement,
+) -> Result<StreamingReader> {
+    let namespace = parsed.schema.as_deref().unwrap_or("default");
+    let table = load_iceberg_table(runtime, catalog.as_ref(), namespace, &parsed.table)?;
+
+    let (schema, stream) = runtime.block_on(async {
+        let mut builder = table.scan();
+        if !parsed.select_all {
+            builder = builder.select(parsed.columns.iter().map(|s| s.as_str()));
+        }
+        if let Some(ref where_expr) = parsed.where_clause {
+            if let Ok(pred) = convert_predicate(where_expr) {
+                builder = builder.with_filter(pred);
+            }
+        }
+
+        let scan = builder.build().map_err(|e| ErrorHelper::from_iceberg(e).to_adbc())?;
+        let schema = iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
+            .map_err(|e| ErrorHelper::from_iceberg(e).to_adbc())?;
+        let stream = scan.to_arrow().await.map_err(|e| ErrorHelper::from_iceberg(e).to_adbc())?;
+        Ok::<_, Error>((schema, stream))
+    })?;
+
+    Ok(StreamingReader::new(Arc::new(schema), stream, runtime.clone()))
+}
+
+fn execute_delta(
+    runtime: &Arc<Runtime>,
+    http_client: &reqwest::Client,
+    base_url: &str,
+    warehouse: &str,
+    s3_config: &S3Config,
+    parsed: &sqlparser::SelectStatement,
+) -> Result<VecReader> {
+    let namespace = parsed.schema.as_deref().unwrap_or("default");
+
+    // Fetch table metadata from Polaris Generic Tables API
+    let generic_table = runtime
+        .block_on(polaris_api::load_generic_table(
+            http_client, base_url, warehouse, namespace, &parsed.table,
+        ))
+        .map_err(|e| Error::with_message_and_status(
+            format!("failed to load generic table: {e}"),
+            Status::IO,
+        ))?;
+
+    let base_location = generic_table.base_location.ok_or_else(|| {
+        Error::with_message_and_status("generic table has no base location", Status::IO)
+    })?;
+
+    let (schema, batches) = delta_reader::execute(runtime, &base_location, s3_config, parsed)?;
+    Ok(VecReader::new(schema, batches))
+}
+
+impl Optionable for PolarisStatement {
     type Option = OptionStatement;
     fn set_option(&mut self, key: Self::Option, _value: OptionValue) -> Result<()> {
         Err(Error::with_message_and_status(format!("unsupported: {key:?}"), Status::NotFound))
@@ -419,7 +467,7 @@ impl Optionable for IcebergStatement {
     }
 }
 
-impl Statement for IcebergStatement {
+impl Statement for PolarisStatement {
     fn set_sql_query(&mut self, query: impl AsRef<str>) -> Result<()> {
         self.sql_query = Some(query.as_ref().to_string());
         Ok(())
@@ -435,34 +483,33 @@ impl Statement for IcebergStatement {
         })?;
 
         let namespace = parsed.schema.as_deref().unwrap_or("default");
-        let table = load_table(&self.runtime, self.catalog.as_ref(), namespace, &parsed.table)?;
 
-        let runtime = self.runtime.clone();
+        // Auto-detect table format via Polaris Generic Tables API
+        let format = self.runtime.block_on(polaris_api::detect_format(
+            &self.http_client,
+            &self.base_url,
+            &self.warehouse,
+            namespace,
+            &parsed.table,
+        ));
 
-        // Build scan and get the arrow stream — only plan, don't read yet.
-        let (schema, stream) = runtime.block_on(async {
-            let mut builder = table.scan();
-
-            if !parsed.select_all {
-                builder = builder.select(parsed.columns.iter().map(|s| s.as_str()));
+        match format {
+            polaris_api::TableFormat::Iceberg => {
+                let reader = execute_iceberg(&self.runtime, &self.catalog, &parsed)?;
+                Ok(EitherReader::Streaming(reader))
             }
-
-            if let Some(ref where_expr) = parsed.where_clause {
-                if let Ok(pred) = convert_predicate(where_expr) {
-                    builder = builder.with_filter(pred);
-                }
+            polaris_api::TableFormat::Delta => {
+                let reader = execute_delta(
+                    &self.runtime,
+                    &self.http_client,
+                    &self.base_url,
+                    &self.warehouse,
+                    &self.s3_config,
+                    &parsed,
+                )?;
+                Ok(EitherReader::Vec(reader))
             }
-
-            let scan = builder.build().map_err(|e| ErrorHelper::from_iceberg(e).to_adbc())?;
-            // Get the full schema — the stream will produce projected batches.
-            // We'll update the schema from the first batch if needed.
-            let schema = iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
-                .map_err(|e| ErrorHelper::from_iceberg(e).to_adbc())?;
-            let stream = scan.to_arrow().await.map_err(|e| ErrorHelper::from_iceberg(e).to_adbc())?;
-            Ok::<_, Error>((schema, stream))
-        })?;
-
-        Ok(StreamingReader::new(Arc::new(schema), stream, runtime))
+        }
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
@@ -470,78 +517,13 @@ impl Statement for IcebergStatement {
     }
 
     fn execute_schema(&mut self) -> Result<Schema> {
-        let query = self.sql_query.as_deref().ok_or_else(|| {
-            Error::with_message_and_status("no query set", Status::InvalidState)
-        })?;
-        let parsed = sqlparser::parse(query).map_err(|e| {
-            Error::with_message_and_status(format!("unsupported SQL: {e}"), Status::InvalidArguments)
-        })?;
-        let namespace = parsed.schema.as_deref().unwrap_or("default");
-        let table = load_table(&self.runtime, self.catalog.as_ref(), namespace, &parsed.table)?;
-        iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
-            .map_err(|e| ErrorHelper::from_iceberg(e).to_adbc())
+        Err(ErrorHelper::not_implemented().message("execute_schema").to_adbc())
     }
 
     fn execute_partitions(&mut self) -> Result<adbc_core::PartitionedResult> {
-        let query = self.sql_query.as_deref().ok_or_else(|| {
-            Error::with_message_and_status("no query set", Status::InvalidState)
-        })?;
-
-        let parsed = sqlparser::parse(query).map_err(|e| {
-            Error::with_message_and_status(format!("unsupported SQL: {e}"), Status::InvalidArguments)
-        })?;
-
-        let namespace = parsed.schema.as_deref().unwrap_or("default");
-        let table = load_table(&self.runtime, self.catalog.as_ref(), namespace, &parsed.table)?;
-
-        let (schema, partitions) = self.runtime.block_on(async {
-            let mut builder = table.scan();
-            if !parsed.select_all {
-                builder = builder.select(parsed.columns.iter().map(|s| s.as_str()));
-            }
-            if let Some(ref where_expr) = parsed.where_clause {
-                if let Ok(pred) = convert_predicate(where_expr) {
-                    builder = builder.with_filter(pred);
-                }
-            }
-
-            let scan = builder.build().map_err(|e| ErrorHelper::from_iceberg(e).to_adbc())?;
-
-            let schema = iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
-                .map_err(|e| ErrorHelper::from_iceberg(e).to_adbc())?;
-
-            use futures::TryStreamExt;
-            let tasks: Vec<iceberg::scan::FileScanTask> = scan
-                .plan_files()
-                .await
-                .map_err(|e| ErrorHelper::from_iceberg(e).to_adbc())?
-                .try_collect()
-                .await
-                .map_err(|e| ErrorHelper::from_iceberg(e).to_adbc())?;
-
-            let mut partition_data = Vec::with_capacity(tasks.len());
-            for task in tasks {
-                let descriptor = PartitionDescriptor {
-                    namespace: namespace.to_string(),
-                    table_name: parsed.table.clone(),
-                    query: query.to_string(),
-                    data_file_path: task.data_file_path.clone(),
-                };
-                let bytes = serde_json::to_vec(&descriptor).map_err(|e| {
-                    Error::with_message_and_status(format!("failed to serialize descriptor: {e}"), Status::Internal)
-                })?;
-                partition_data.push(bytes);
-            }
-
-            Ok::<_, Error>((schema, partition_data))
-        })?;
-
-        Ok(adbc_core::PartitionedResult {
-            schema,
-            partitions,
-            rows_affected: -1,
-        })
+        Err(ErrorHelper::not_implemented().message("execute_partitions").to_adbc())
     }
+
     fn get_parameter_schema(&self) -> Result<Schema> {
         Err(ErrorHelper::not_implemented().message("get_parameter_schema").to_adbc())
     }
@@ -566,7 +548,34 @@ use std::pin::Pin;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 
-/// Streaming reader that pulls batches from an async iceberg stream on each next() call.
+/// Either a streaming (Iceberg) or vec-based (Delta) reader.
+pub enum EitherReader {
+    Streaming(StreamingReader),
+    Vec(VecReader),
+}
+
+impl Iterator for EitherReader {
+    type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            EitherReader::Streaming(r) => r.next(),
+            EitherReader::Vec(r) => r.next(),
+        }
+    }
+}
+
+impl RecordBatchReader for EitherReader {
+    fn schema(&self) -> Arc<Schema> {
+        match self {
+            EitherReader::Streaming(r) => r.schema(),
+            EitherReader::Vec(r) => r.schema(),
+        }
+    }
+}
+
+unsafe impl Send for EitherReader {}
+
+/// Streaming reader for Iceberg async streams.
 pub struct StreamingReader {
     schema: Arc<Schema>,
     stream: Pin<Box<BoxStream<'static, std::result::Result<RecordBatch, arrow_schema::ArrowError>>>>,
@@ -575,8 +584,6 @@ pub struct StreamingReader {
     done: bool,
 }
 
-// Safety: the stream is Send (iceberg guarantees this) and we only access it
-// through block_on which is synchronized.
 unsafe impl Send for StreamingReader {}
 
 impl StreamingReader {
@@ -590,7 +597,6 @@ impl StreamingReader {
                 .map(|r| r.map_err(|e| arrow_schema::ArrowError::ExternalError(Box::new(e))))
                 .boxed();
 
-        // Read the first batch to get the actual (possibly projected) schema.
         let first = runtime.block_on(mapped.next());
         let (schema, first_batch) = match first {
             Some(Ok(batch)) => {
@@ -614,7 +620,6 @@ impl Iterator for StreamingReader {
     type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Return buffered first batch before streaming.
         if let Some(batch) = self.first.take() {
             return Some(Ok(batch));
         }
@@ -636,21 +641,38 @@ impl Iterator for StreamingReader {
 }
 
 impl RecordBatchReader for StreamingReader {
-    fn schema(&self) -> Arc<Schema> {
-        self.schema.clone()
+    fn schema(&self) -> Arc<Schema> { self.schema.clone() }
+}
+
+/// Vec-based reader for Delta batches (already materialized).
+pub struct VecReader {
+    schema: Arc<Schema>,
+    batches: std::vec::IntoIter<RecordBatch>,
+}
+
+impl VecReader {
+    fn new(schema: Arc<Schema>, batches: Vec<RecordBatch>) -> Self {
+        Self {
+            schema,
+            batches: batches.into_iter(),
+        }
     }
 }
 
-/// Simple reader for empty results.
+impl Iterator for VecReader {
+    type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.batches.next().map(Ok)
+    }
+}
+
+impl RecordBatchReader for VecReader {
+    fn schema(&self) -> Arc<Schema> { self.schema.clone() }
+}
+
+/// Empty reader stub.
 pub struct BatchReader {
     schema: Arc<Schema>,
-    done: bool,
-}
-
-impl BatchReader {
-    fn new_empty(schema: Arc<Schema>) -> Self {
-        Self { schema, done: true }
-    }
 }
 
 impl Iterator for BatchReader {
@@ -666,4 +688,4 @@ impl RecordBatchReader for BatchReader {
 // C ABI export
 // ---------------------------------------------------------------------------
 
-adbc_ffi::export_driver!(AdbcDriverIcebergInit, IcebergDriver);
+adbc_ffi::export_driver!(AdbcDriverPolarisInit, PolarisDriver);
