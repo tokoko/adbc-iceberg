@@ -21,6 +21,41 @@ The idea: instead of each engine (DuckDB, DataFusion, Spark, etc.) implementing 
 
 Both produce identical Arrow output and are loadable from Python, DuckDB, or any ADBC consumer.
 
+## Install with dbc
+
+Releases double as a [dbc](https://github.com/columnar-tech/dbc) driver registry: every
+release carries an `index.yaml` describing all published versions, so dbc can install the
+driver without the package being mirrored into a central registry.
+
+Add the repository as a registry in `dbc.toml` (or the global `config.toml`):
+
+```toml
+[[registries]]
+name = 'adbc-iceberg'
+url  = 'https://github.com/tokoko/adbc-iceberg/releases/latest/download'
+```
+
+Then install as usual:
+
+```bash
+dbc install iceberg --no-verify
+dbc install 'iceberg>=0.1' --no-verify
+```
+
+```python
+from adbc_driver_manager import dbapi
+
+with dbapi.connect(driver="iceberg", db_kwargs={...}) as conn:
+    ...
+```
+
+`--no-verify` is required because these artifacts are not signed by Columnar. dbc only
+ships the Columnar public key, so it cannot verify a third-party publisher; the flag tells
+it to skip the signature check. Install only if you trust this repository.
+
+Currently published for `linux_amd64` only. On other platforms dbc reports
+`no package found for platform '<tuple>'`; build from source instead.
+
 ## Quick Start
 
 ```bash
