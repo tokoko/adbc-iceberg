@@ -1,0 +1,117 @@
+name: Release
+
+# Publishes the driver as a dbc-installable package.
+#
+# Each release carries:
+#   - iceberg_<platform>_<version>.tar.gz   the flat driver archive
+#   - index.yaml                            the dbc registry index, covering
+#                                           every version released so far
+#
+# The index uses absolute package URLs pointing at each version's own release,
+# so a dbc user only needs:
+#
+#   [[registries]]
+#   name = 'adbc-iceberg'
+#   url  = 'https://github.com/tokoko/adbc-iceberg/releases/latest/download'
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (must already exist)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  DRIVER: iceberg
+  PLATFORM: linux_amd64
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve version
+        id: version
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # Strip any prefix path (e.g. rust/v0.1.0 -> v0.1.0); dbc parses the
+          # leading "v" fine, and we keep it for consistency with adbc-drivers.
+          echo "version=${TAG##*/}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Build driver
+        run: cargo build --release --manifest-path rust/Cargo.toml
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - run: pip install pyyaml
+
+      - name: Package driver
+        id: package
+        run: |
+          python ci/make_package.py \
+            --lib rust/target/release/libadbc_driver_iceberg.so \
+            --driver "$DRIVER" \
+            --version "${{ steps.version.outputs.version }}" \
+            --platform "$PLATFORM" \
+            --outdir dist
+
+      - name: Verify archive layout
+        run: |
+          # dbc rejects any directory entry and requires a top-level MANIFEST.
+          tar -tzvf "dist/${{ steps.package.outputs.asset }}"
+          tar -tzf  "dist/${{ steps.package.outputs.asset }}" | grep -qx MANIFEST
+          ! tar -tzf "dist/${{ steps.package.outputs.asset }}" | grep -q '/'
+
+      - name: Fetch previous index
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p prev
+          # "latest" is still the previous release at this point.
+          gh release download --pattern index.yaml --dir prev \
+            || echo "no previous release with an index.yaml; starting a new index"
+
+      - name: Update index
+        run: |
+          python ci/update_index.py \
+            --existing prev/index.yaml \
+            --out dist/index.yaml \
+            --repo "$GITHUB_REPOSITORY" \
+            --tag "${{ steps.version.outputs.tag }}" \
+            --version "${{ steps.version.outputs.version }}" \
+            --driver "$DRIVER" \
+            --url "https://github.com/$GITHUB_REPOSITORY" \
+            --package "$PLATFORM=${{ steps.package.outputs.asset }}"
+          cat dist/index.yaml
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              "dist/${{ steps.package.outputs.asset }}" dist/index.yaml --clobber
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --generate-notes \
+              "dist/${{ steps.package.outputs.asset }}" dist/index.yaml
+          fi
