@@ -16,8 +16,8 @@ The idea: instead of each engine (DuckDB, DataFusion, Spark, etc.) implementing 
 | Column projection | Yes | Yes |
 | Predicate pushdown | Row group stats + vectorized filter | Row group stats + page index + row filter |
 | Partitioned execution | Broken (re-reads all files per partition) | Correct (reads only assigned file) |
-| Catalog enumeration | GetObjects, GetTableSchema, GetTableTypes | Not yet implemented |
-| Statement options | Snapshot ID, time travel, branch, batch size | Not yet implemented |
+| Catalog enumeration | GetObjects, GetTableSchema, GetTableTypes | GetObjects, GetTableSchema, GetTableTypes, GetInfo |
+| Statement options | Snapshot ID, time travel, branch, batch size | Snapshot ID, time travel, branch/tag, batch size |
 
 Both produce identical Arrow output and are loadable from Python, DuckDB, or any ADBC consumer.
 
@@ -129,24 +129,33 @@ SELECT * FROM adbc_scan(0, 'SELECT * FROM default.my_table');
 |---|---|---|---|
 | `uri` | REST catalog URI | Yes | Yes |
 | `adbc.iceberg.catalog.name` | Catalog name (default: `"default"`) | Yes | Yes |
-| `adbc.iceberg.auth.token` | Static bearer token | Yes | — |
-| `adbc.iceberg.auth.credential` | OAuth2 client credentials | Yes | — |
-| `adbc.iceberg.auth.scope` | OAuth2 scope | Yes | — |
-| `adbc.iceberg.auth.uri` | Custom token endpoint URL | Yes | — |
+| `adbc.iceberg.auth.token` | Static bearer token | Yes | Yes |
+| `adbc.iceberg.auth.credential` | OAuth2 client credentials | Yes | Yes |
+| `adbc.iceberg.auth.scope` | OAuth2 scope | Yes | Yes |
+| `adbc.iceberg.auth.uri` | Custom token endpoint URL | Yes | Yes |
 | `adbc.iceberg.s3.endpoint` | S3-compatible endpoint URL | Yes | Yes |
 | `adbc.iceberg.s3.region` | AWS region | Yes | Yes |
 | `adbc.iceberg.s3.access_key` | S3 access key ID | Yes | Yes |
 | `adbc.iceberg.s3.secret_key` | S3 secret access key | Yes | Yes |
 
-### Statement Options (Go driver only)
+### Statement Options
 
-| Option | Description |
-|---|---|
-| `adbc.iceberg.snapshot_id` | Scan a specific snapshot (time travel) |
-| `adbc.iceberg.as_of_timestamp` | Scan as of timestamp (ms since epoch) |
-| `adbc.iceberg.branch` | Scan a named branch |
-| `adbc.iceberg.start_snapshot_id` | Incremental scan start snapshot |
-| `adbc.iceberg.batch_size` | Arrow batch size (default: 131072) |
+| Option | Description | Go | Rust |
+|---|---|---|---|
+| `adbc.iceberg.snapshot_id` | Scan a specific snapshot (time travel) | Yes | Yes |
+| `adbc.iceberg.as_of_timestamp` | Scan as of timestamp (ms since epoch) | Yes | Yes |
+| `adbc.iceberg.branch` | Scan the head of a named branch or tag | Yes | Yes |
+| `adbc.iceberg.start_snapshot_id` | Incremental scan start snapshot | Yes | — |
+| `adbc.iceberg.batch_size` | Arrow batch size (Go default: 131072) | Yes | Yes |
+
+In the Rust driver, `snapshot_id`, `as_of_timestamp` and `branch` are mutually exclusive, and
+setting an option to an empty string clears it. Partitions from `ExecutePartitions` are pinned
+to the snapshot they were planned against.
+
+### Connection Options
+
+The standard `adbc.connection.catalog` and `adbc.connection.db_schema` options are supported.
+The current db_schema is the namespace used for unqualified table names (default: `default`).
 
 ## SQL Support
 
@@ -216,8 +225,6 @@ Iceberg REST Catalog ──► S3 / GCS / Azure
 - **No page-level predicate pushdown** — Arrow Go's Parquet reader lacks page index and dictionary filtering
 
 ### Rust Driver
-- **No catalog enumeration** — `GetObjects`, `GetTableSchema`, `GetTableTypes` not yet implemented
-- **No statement options** — snapshot ID, time travel, branch not yet wired up
 - **opendal S3 throughput** — 2.8x slower than `object_store` for raw reads; pending [upstream fix](https://github.com/apache/iceberg-rust/pull/2257)
 - **Partitioned execution re-plans** — `ReadPartition` re-loads the table and re-plans files (filtering by path) because `FileScanTask` [cannot be fully serialized](https://github.com/apache/iceberg-rust/issues/2220)
 

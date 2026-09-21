@@ -271,6 +271,10 @@ pub fn parse(sql: &str) -> Result<SelectStatement, String> {
         None
     };
 
+    if *p.peek() != Token::Eof {
+        return Err(format!("unexpected trailing input: {:?}", p.peek()));
+    }
+
     Ok(SelectStatement {
         select_all,
         columns,
