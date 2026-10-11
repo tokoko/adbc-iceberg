@@ -179,12 +179,6 @@ impl IcebergDatabase {
             }
         }
 
-        // iceberg-rust defaults to virtual-hosted-style URLs, which custom
-        // endpoints (MinIO and the like) generally don't serve.
-        if props.contains_key("s3.endpoint") {
-            props.entry("s3.path-style-access".to_string()).or_insert_with(|| "true".to_string());
-        }
-
         Ok(props)
     }
 }

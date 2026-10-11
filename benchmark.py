@@ -40,6 +40,13 @@ ADBC_DB_KWARGS = {
 }
 
 
+def db_kwargs(driver_path: str) -> dict:
+    """Database options for a driver; the Rust driver needs path-style URLs for MinIO."""
+    if driver_path == RUST_DRIVER_PATH:
+        return {**ADBC_DB_KWARGS, "adbc.iceberg.s3.path_style_access": "true"}
+    return ADBC_DB_KWARGS
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -55,7 +62,7 @@ def adbc_conn(driver_path=GO_DRIVER_PATH):
     return adbc_driver_manager.dbapi.connect(
         driver=driver_path,
         entrypoint="AdbcDriverIcebergInit",
-        db_kwargs=ADBC_DB_KWARGS,
+        db_kwargs=db_kwargs(driver_path),
     )
 
 
@@ -116,7 +123,7 @@ def _duckdb_adbc_scan(query: str, driver_path: str) -> tuple[pa.Table, float]:
     con.execute("LOAD adbc_scanner")
     handle = con.execute(
         "SELECT adbc_connect($1)",
-        [{"driver": driver_path, "entrypoint": "AdbcDriverIcebergInit", **ADBC_DB_KWARGS}],
+        [{"driver": driver_path, "entrypoint": "AdbcDriverIcebergInit", **db_kwargs(driver_path)}],
     ).fetchone()[0]
     escaped = query.replace("'", "''")
     result, elapsed = timed(
@@ -159,7 +166,7 @@ def datafusion_adbc(query: str) -> tuple[pa.Table, float]:
 def adbc_partitioned(query: str, driver_path: str = GO_DRIVER_PATH) -> tuple[pa.Table, float, float, int]:
     """ADBC ExecutePartitions + ReadPartition (simulated distributed scan)."""
     db = adbc_driver_manager.AdbcDatabase(
-        driver=driver_path, entrypoint="AdbcDriverIcebergInit", **ADBC_DB_KWARGS,
+        driver=driver_path, entrypoint="AdbcDriverIcebergInit", **db_kwargs(driver_path),
     )
     conn = adbc_driver_manager.AdbcConnection(db)
     stmt = adbc_driver_manager.AdbcStatement(conn)

@@ -93,6 +93,8 @@ conn = adbc_driver_manager.dbapi.connect(
         "adbc.iceberg.s3.endpoint": "http://localhost:9000",
         "adbc.iceberg.s3.access_key": "admin",
         "adbc.iceberg.s3.secret_key": "password",
+        # Rust driver only: MinIO needs path-style URLs
+        "adbc.iceberg.s3.path_style_access": "true",
     },
 )
 
@@ -115,7 +117,8 @@ SELECT adbc_connect({
     'adbc.iceberg.catalog.name': 'rest',
     'adbc.iceberg.s3.endpoint': 'http://localhost:9000',
     'adbc.iceberg.s3.access_key': 'admin',
-    'adbc.iceberg.s3.secret_key': 'password'
+    'adbc.iceberg.s3.secret_key': 'password',
+    'adbc.iceberg.s3.path_style_access': 'true'  -- Rust driver only
 });
 
 SELECT * FROM adbc_scan(0, 'SELECT * FROM default.my_table');
@@ -137,7 +140,7 @@ SELECT * FROM adbc_scan(0, 'SELECT * FROM default.my_table');
 | `adbc.iceberg.s3.region` | AWS region | Yes | Yes |
 | `adbc.iceberg.s3.access_key` | S3 access key ID | Yes | Yes |
 | `adbc.iceberg.s3.secret_key` | S3 secret access key | Yes | Yes |
-| `adbc.iceberg.s3.path_style_access` | Use path-style S3 URLs (default: `true` when an endpoint is set) | — | Yes |
+| `adbc.iceberg.s3.path_style_access` | Use path-style S3 URLs instead of virtual-hosted-style (default: `false`); set to `true` for MinIO | — | Yes |
 
 ### Statement Options
 

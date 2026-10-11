@@ -30,7 +30,7 @@ services:
       start_period: 10s
 
   minio:
-    image: minio/minio
+    image: cgr.dev/chainguard/minio:latest
     container_name: minio
     environment:
       - MINIO_ROOT_USER=admin
@@ -45,13 +45,14 @@ services:
       - "9001:9001"
     command: ["server", "/data", "--console-address", ":9001"]
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:9000/minio/health/live"]
+      # The image has no curl or grep; probe the health endpoint over bash's /dev/tcp.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/9000 && printf 'GET /minio/health/live HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ $$status == *' 200 '* ]]"]
       interval: 2s
       timeout: 10s
       retries: 5
 
   mc:
-    image: minio/mc
+    image: cgr.dev/chainguard/minio-client:latest-dev
     container_name: mc
     networks:
       - iceberg
