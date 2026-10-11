@@ -12,7 +12,7 @@ Usage:
 import os
 import adbc_driver_manager.dbapi
 
-DRIVER_PATH = os.path.join(os.path.dirname(__file__), "libadbc_driver_iceberg.so")
+DRIVER_PATH = os.path.join(os.path.dirname(__file__), "build", "libadbc_driver_iceberg_rust.so")
 
 db_kwargs = {
     "uri": os.environ.get("ICEBERG_CATALOG_URI", "http://localhost:8181"),
@@ -21,6 +21,8 @@ db_kwargs = {
     "adbc.iceberg.s3.region": "us-east-1",
     "adbc.iceberg.s3.access_key": "admin",
     "adbc.iceberg.s3.secret_key": "password",
+    # MinIO needs path-style URLs
+    "adbc.iceberg.s3.path_style_access": "true",
 }
 
 
