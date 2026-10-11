@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .access_key_id("admin")
             .secret_access_key("password");
 
-        let op = Operator::new(builder)?.finish();
+        let op = Operator::new(builder)?;
 
         // Warm up
         let _ = op.stat(KEY).await?;
@@ -131,7 +131,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let storage: Arc<dyn iceberg::io::StorageFactory> =
             Arc::new(OpenDalStorageFactory::S3 {
-                configured_scheme: "s3".to_string(),
                 customized_credential_load: None,
             });
 

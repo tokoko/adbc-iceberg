@@ -22,7 +22,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     props.insert("s3.secret-access-key".into(), "password".into());
 
     let storage: Arc<dyn iceberg::io::StorageFactory> = Arc::new(OpenDalStorageFactory::S3 {
-        configured_scheme: "s3".to_string(),
         customized_credential_load: None,
     });
 

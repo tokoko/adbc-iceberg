@@ -8,7 +8,7 @@ The idea: instead of each engine (DuckDB, DataFusion, Spark, etc.) implementing 
 
 | | Go | Rust |
 |---|---|---|
-| Iceberg library | [iceberg-go](https://github.com/apache/iceberg-go) | [iceberg-rust](https://github.com/apache/iceberg-rust) 0.9 |
+| Iceberg library | [iceberg-go](https://github.com/apache/iceberg-go) | [iceberg-rust](https://github.com/apache/iceberg-rust) (pinned `main` commit) |
 | Parquet reader | Arrow Go | parquet-rs |
 | S3 client | gocloud (AWS Go SDK) | opendal |
 | ADBC framework | [driverbase-go](https://github.com/adbc-drivers/driverbase-go) | [adbc_core](https://crates.io/crates/adbc_core) + [adbc_ffi](https://crates.io/crates/adbc_ffi) |
@@ -137,6 +137,7 @@ SELECT * FROM adbc_scan(0, 'SELECT * FROM default.my_table');
 | `adbc.iceberg.s3.region` | AWS region | Yes | Yes |
 | `adbc.iceberg.s3.access_key` | S3 access key ID | Yes | Yes |
 | `adbc.iceberg.s3.secret_key` | S3 secret access key | Yes | Yes |
+| `adbc.iceberg.s3.path_style_access` | Use path-style S3 URLs (default: `true` when an endpoint is set) | — | Yes |
 
 ### Statement Options
 
@@ -226,7 +227,7 @@ Iceberg REST Catalog ──► S3 / GCS / Azure
 
 ### Rust Driver
 - **opendal S3 throughput** — 2.8x slower than `object_store` for raw reads; pending [upstream fix](https://github.com/apache/iceberg-rust/pull/2257)
-- **Partitioned execution re-plans** — `ReadPartition` re-loads the table and re-plans files (filtering by path) because `FileScanTask` [cannot be fully serialized](https://github.com/apache/iceberg-rust/issues/2220)
+- **Unreleased iceberg-rust** — pinned to a `main` commit for serializable `FileScanTask` ([#3091](https://github.com/apache/iceberg-rust/pull/3091)), which lets `ReadPartition` read its file without re-planning; move back to a crates.io release once one includes it
 
 ### Both
 - **Read-only** — no write/append support

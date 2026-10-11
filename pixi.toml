@@ -6,7 +6,7 @@ platforms = ["linux-64"]
 [dependencies]
 python = ">=3.11"
 go = ">=1.24"
-rust = ">=1.85"
+rust = ">=1.95"
 clang-tools = ">=16"
 c-compiler = "*"
 cxx-compiler = "*"
