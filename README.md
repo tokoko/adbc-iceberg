@@ -172,7 +172,7 @@ Supported WHERE operators: `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `IS NULL`, `IS
 
 ## Benchmarks
 
-5,000,000 rows across 5 Parquet files, unpartitioned table, reading from a local REST catalog + MinIO. Median of five runs. PyIceberg is included as a baseline with no ADBC overhead.
+5,000,000 rows across 5 Parquet files, unpartitioned table, reading from a local REST catalog + MinIO. Median of five runs. PyIceberg is included as a baseline; it reads through PyArrow's C++ Parquet reader and S3 client, not iceberg-rust, so it shares no reader code with the driver.
 
 ```
 Engine                         full scan    projection    id < 100    name=alice    proj+pred
@@ -187,7 +187,7 @@ Partitioned (5x)                 0.33s           —            —            �
 
 ### Key Findings
 
-**Full scan**: the driver (0.37s) is on par with DuckDB's built-in Iceberg reader (0.36s) but more than 2x slower than PyIceberg (0.16s). Raw benchmarking showed opendal reading bytes 2.8x slower than `object_store` — there is an [active PR](https://github.com/apache/iceberg-rust/pull/2257) to add `object_store` as an alternative storage backend for iceberg-rust.
+**Full scan**: the driver (0.37s) is on par with DuckDB's built-in Iceberg reader (0.36s) but more than 2x slower than PyIceberg (0.16s). Raw benchmarking showed opendal reading bytes 2.8x slower than `object_store` — there is an [active PR](https://github.com/apache/iceberg-rust/pull/3165) to add `object_store` as an alternative storage backend for iceberg-rust.
 
 **Predicate pushdown (`name='alice'`)**: parquet-rs supports page index filtering and dictionary filtering, skipping pages that can't match.
 
@@ -217,7 +217,7 @@ Iceberg REST Catalog ──► S3 / GCS / Azure
 
 ## Known Limitations
 
-- **opendal S3 throughput** — 2.8x slower than `object_store` for raw reads; pending [upstream fix](https://github.com/apache/iceberg-rust/pull/2257)
+- **opendal S3 throughput** — 2.8x slower than `object_store` for raw reads; pending [upstream fix](https://github.com/apache/iceberg-rust/pull/3165)
 - **Unreleased iceberg-rust** — pinned to a `main` commit for serializable `FileScanTask` ([#3091](https://github.com/apache/iceberg-rust/pull/3091)), which lets `ReadPartition` read its file without re-planning; move back to a crates.io release once one includes it
 - **Read-only** — no write/append support
 - **REST catalog only** (Glue, HMS, SQL could be added via iceberg-rust crates)
