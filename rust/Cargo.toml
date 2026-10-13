@@ -7,19 +7,20 @@ edition = "2024"
 crate-type = ["lib", "cdylib"]
 
 [dependencies]
-adbc_core = "0.22.0"
-adbc_ffi = "0.22.0"
+adbc_core = "0.24.0"
+adbc_ffi = "0.24.0"
 driverbase = { git = "https://github.com/adbc-drivers/driverbase-rs.git" }
-arrow-array = "57"
-arrow-schema = "57"
-iceberg = "0.9"
-iceberg-catalog-rest = "0.9"
-iceberg-storage-opendal = "0.9"
+arrow-array = "59.3"
+arrow-schema = "59.3"
+# Pinned to unreleased main for serializable FileScanTask (apache/iceberg-rust#3091).
+iceberg = { git = "https://github.com/apache/iceberg-rust.git", rev = "b2e90754b1f9eaea741d353d51ae644aa9cef479" }
+iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust.git", rev = "b2e90754b1f9eaea741d353d51ae644aa9cef479" }
+iceberg-storage-opendal = { git = "https://github.com/apache/iceberg-rust.git", rev = "b2e90754b1f9eaea741d353d51ae644aa9cef479" }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-opendal = { version = "0.55", features = ["services-s3"] }
+opendal = { version = "0.58", features = ["services-s3"] }
 object_store = { version = "0.12", features = ["aws"] }
 parquet = { version = "55", features = ["async", "object_store"] }
 bytes = "1"

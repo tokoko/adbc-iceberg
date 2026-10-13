@@ -1,5 +1,3 @@
-#![allow(refining_impl_trait)]
-
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
@@ -19,7 +17,7 @@ use driverbase::get_objects::{ColumnInfo, GetObjectsImpl, TableAndColumnInfo, Ta
 
 use iceberg::expr::{Predicate, Reference};
 use iceberg::io::StorageFactory;
-use iceberg::scan::TableScan;
+use iceberg::scan::{FileScanTask, TableScan};
 use iceberg::spec::Datum;
 use iceberg::table::Table;
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
@@ -49,20 +47,15 @@ const DEFAULT_NAMESPACE: &str = "default";
 const TABLE_TYPE: &str = "TABLE";
 
 /// Partition descriptor — serialized as JSON in ExecutePartitions,
-/// deserialized in ReadPartition. We store the query + task file path
-/// so read_partition can re-plan and filter to the specific file.
+/// deserialized in ReadPartition. It carries the planned scan task itself, so
+/// read_partition reads the file directly without re-planning the scan.
 #[derive(Serialize, Deserialize)]
 struct PartitionDescriptor {
     namespace: String,
     table_name: String,
-    /// The SQL query to re-execute for this partition.
-    query: String,
-    /// The data file path — used to filter planned tasks to just this one.
-    data_file_path: String,
-    /// Snapshot the partitions were planned against, so every partition reads
-    /// the same table state even if the table is updated in between.
-    #[serde(default)]
-    snapshot_id: Option<i64>,
+    /// The planned task: data file, projection, predicate and delete files,
+    /// all fixed at the snapshot the partitions were planned against.
+    task: FileScanTask,
     #[serde(default)]
     batch_size: Option<usize>,
 }
@@ -178,6 +171,7 @@ impl IcebergDatabase {
             ("adbc.iceberg.s3.region", "s3.region"),
             ("adbc.iceberg.s3.access_key", "s3.access-key-id"),
             ("adbc.iceberg.s3.secret_key", "s3.secret-access-key"),
+            ("adbc.iceberg.s3.path_style_access", "s3.path-style-access"),
         ];
         for (adbc_key, iceberg_key) in mappings {
             if let Some(v) = self.opt(adbc_key) {
@@ -231,7 +225,6 @@ impl Database for IcebergDatabase {
         })?);
 
         let storage_factory: Arc<dyn StorageFactory> = Arc::new(OpenDalStorageFactory::S3 {
-            configured_scheme: "s3".to_string(),
             customized_credential_load: None,
         });
 
@@ -359,14 +352,14 @@ impl Connection for IcebergConnection {
     }
 
     fn cancel(&mut self) -> Result<()> { Ok(()) }
-    fn get_info(&self, codes: Option<HashSet<InfoCode>>) -> Result<impl RecordBatchReader + Send> {
+    fn get_info(&self, codes: Option<HashSet<InfoCode>>) -> Result<Box<dyn RecordBatchReader + Send>> {
         let mut registry = InfoRegistry::new();
         registry.add_string(InfoCode::VendorName, "Apache Iceberg");
         registry.add_string(InfoCode::DriverName, "ADBC Iceberg Driver (Rust)");
         registry.add_string(InfoCode::DriverVersion, env!("CARGO_PKG_VERSION"));
         Ok(registry.get_info(codes).build())
     }
-    fn get_objects(&self, depth: ObjectDepth, catalog: Option<&str>, db_schema: Option<&str>, table_name: Option<&str>, table_type: Option<Vec<&str>>, column_name: Option<&str>) -> Result<impl RecordBatchReader + Send> {
+    fn get_objects(&self, depth: ObjectDepth, catalog: Option<&str>, db_schema: Option<&str>, table_name: Option<&str>, table_type: Option<Vec<&str>>, column_name: Option<&str>) -> Result<Box<dyn RecordBatchReader + Send>> {
         Ok(driverbase::get_objects::get_objects(
             self.objects(), depth, catalog, db_schema, table_name, table_type, column_name,
         ))
@@ -377,57 +370,42 @@ impl Connection for IcebergConnection {
         let table = load_table(&self.runtime, self.catalog.as_ref(), &namespace, table_name)?;
         iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).map_err(iceberg_err)
     }
-    fn get_table_types(&self) -> Result<impl RecordBatchReader + Send> {
+    fn get_table_types(&self) -> Result<Box<dyn RecordBatchReader + Send>> {
         let types: ArrayRef = Arc::new(StringArray::from(vec![TABLE_TYPE]));
         let batch = RecordBatch::try_new(GET_TABLE_TYPES_SCHEMA.clone(), vec![types])?;
-        Ok(RecordBatchIterator::new(vec![Ok(batch)], GET_TABLE_TYPES_SCHEMA.clone()))
+        Ok(Box::new(RecordBatchIterator::new(vec![Ok(batch)], GET_TABLE_TYPES_SCHEMA.clone())))
     }
-    fn read_partition(&self, partition: impl AsRef<[u8]>) -> Result<impl RecordBatchReader + Send> {
+    fn read_partition(&self, partition: impl AsRef<[u8]>) -> Result<Box<dyn RecordBatchReader + Send>> {
         let descriptor: PartitionDescriptor = serde_json::from_slice(partition.as_ref())
             .map_err(|e| invalid_arg(format!("invalid partition descriptor: {e}")))?;
+        let schema = task_output_schema(&descriptor.task)?;
 
-        let parsed = parse_query(&descriptor.query)?;
-
+        // The table is only loaded for its FileIO; the task already fixes what to read.
         let table = load_table(
             &self.runtime, self.catalog.as_ref(),
             &descriptor.namespace, &descriptor.table_name,
         )?;
-        let schema = output_schema(&table, descriptor.snapshot_id, &parsed)?;
 
         let stream = self.runtime.block_on(async {
-            let scan = build_scan(&table, &parsed, descriptor.snapshot_id, descriptor.batch_size)?;
-
-            // Plan all files, then filter to just the one matching our descriptor.
-            use futures::TryStreamExt;
-            let tasks: Vec<iceberg::scan::FileScanTask> = scan
-                .plan_files()
-                .await
-                .map_err(iceberg_err)?
-                .try_collect()
-                .await
-                .map_err(iceberg_err)?;
-
-            let matching: Vec<_> = tasks
-                .into_iter()
-                .filter(|t| t.data_file_path == descriptor.data_file_path)
-                .collect();
-
-            let file_io = table.file_io().clone();
-            let mut reader_builder = iceberg::arrow::ArrowReaderBuilder::new(file_io);
+            let mut reader_builder = table.reader_builder();
             if let Some(batch_size) = descriptor.batch_size {
                 reader_builder = reader_builder.with_batch_size(batch_size);
             }
-            let task_stream = futures::stream::iter(matching.into_iter().map(Ok));
-            reader_builder.build().read(Box::pin(task_stream)).map_err(iceberg_err)
+            let task_stream = futures::stream::iter([Ok(descriptor.task)]);
+            reader_builder
+                .build()
+                .read(Box::pin(task_stream))
+                .map(|result| result.stream())
+                .map_err(iceberg_err)
         })?;
 
-        Ok(StreamingReader::new(Arc::new(schema), stream, self.runtime.clone()))
+        Ok(Box::new(StreamingReader::new(Arc::new(schema), stream, self.runtime.clone())))
     }
-    fn get_statistic_names(&self) -> Result<impl RecordBatchReader + Send> {
-        Err::<BatchReader, _>(ErrorHelper::not_implemented().message("get_statistic_names").to_adbc())
+    fn get_statistic_names(&self) -> Result<Box<dyn RecordBatchReader + Send>> {
+        Err(ErrorHelper::not_implemented().message("get_statistic_names").to_adbc())
     }
-    fn get_statistics(&self, _catalog: Option<&str>, _db_schema: Option<&str>, _table_name: Option<&str>, _approximate: bool) -> Result<impl RecordBatchReader + Send> {
-        Err::<BatchReader, _>(ErrorHelper::not_implemented().message("get_statistics").to_adbc())
+    fn get_statistics(&self, _catalog: Option<&str>, _db_schema: Option<&str>, _table_name: Option<&str>, _approximate: bool) -> Result<Box<dyn RecordBatchReader + Send>> {
+        Err(ErrorHelper::not_implemented().message("get_statistics").to_adbc())
     }
     fn commit(&mut self) -> Result<()> { Err(ErrorHelper::not_implemented().message("commit").to_adbc()) }
     fn rollback(&mut self) -> Result<()> { Err(ErrorHelper::not_implemented().message("rollback").to_adbc()) }
@@ -677,6 +655,26 @@ fn output_schema(table: &Table, snapshot_id: Option<i64>, parsed: &sqlparser::Se
 }
 
 /// Convert parsed WHERE AST to iceberg Predicate.
+/// The Arrow schema a planned task produces: the task's snapshot schema with
+/// its projected fields, in projection order.
+fn task_output_schema(task: &FileScanTask) -> Result<Schema> {
+    let iceberg_schema = task.schema();
+    let schema = iceberg::arrow::schema_to_arrow_schema(iceberg_schema).map_err(iceberg_err)?;
+    let indices = task
+        .project_field_ids()
+        .iter()
+        .map(|id| {
+            let field = iceberg_schema
+                .field_by_id(*id)
+                .ok_or_else(|| invalid_arg(format!("projected field id {id} not found in task schema")))?;
+            schema
+                .index_of(&field.name)
+                .map_err(|_| invalid_arg(format!("column '{}' not found", field.name)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(schema.project(&indices)?)
+}
+
 fn convert_predicate(expr: &sqlparser::Expr) -> Result<Predicate> {
     match expr {
         sqlparser::Expr::Binary { column, op, value } => {
@@ -786,14 +784,14 @@ impl Statement for IcebergStatement {
         Ok(())
     }
 
-    fn execute(&mut self) -> Result<impl RecordBatchReader + Send> {
+    fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send>> {
         let q = self.resolve()?;
         let schema = output_schema(&q.table, q.snapshot_id, &q.parsed)?;
         let scan = build_scan(&q.table, &q.parsed, q.snapshot_id, self.scan_opts.batch_size)?;
 
         // Only plan here; batches are read lazily by the reader.
         let stream = self.runtime.block_on(scan.to_arrow()).map_err(iceberg_err)?;
-        Ok(StreamingReader::new(Arc::new(schema), stream, self.runtime.clone()))
+        Ok(Box::new(StreamingReader::new(Arc::new(schema), stream, self.runtime.clone())))
     }
 
     fn execute_update(&mut self) -> Result<Option<i64>> {
@@ -806,15 +804,11 @@ impl Statement for IcebergStatement {
     }
 
     fn execute_partitions(&mut self) -> Result<adbc_core::PartitionedResult> {
-        let query = self.query()?.to_string();
         let q = self.resolve()?;
         let schema = output_schema(&q.table, q.snapshot_id, &q.parsed)?;
         let scan = build_scan(&q.table, &q.parsed, q.snapshot_id, self.scan_opts.batch_size)?;
-        // Pin partitions to the snapshot actually planned, so readers see the
-        // same table state even if the table is updated before they run.
-        let snapshot_id = scan.snapshot().map(|s| s.snapshot_id());
 
-        let tasks: Vec<iceberg::scan::FileScanTask> = self.runtime.block_on(async {
+        let tasks: Vec<FileScanTask> = self.runtime.block_on(async {
             use futures::TryStreamExt;
             scan.plan_files()
                 .await
@@ -830,9 +824,7 @@ impl Statement for IcebergStatement {
                 let descriptor = PartitionDescriptor {
                     namespace: q.namespace.clone(),
                     table_name: q.parsed.table.clone(),
-                    query: query.clone(),
-                    data_file_path: task.data_file_path,
-                    snapshot_id,
+                    task,
                     batch_size: self.scan_opts.batch_size,
                 };
                 serde_json::to_vec(&descriptor).map_err(|e| {
@@ -944,27 +936,6 @@ impl RecordBatchReader for StreamingReader {
     fn schema(&self) -> Arc<Schema> {
         self.schema.clone()
     }
-}
-
-/// Simple reader for empty results.
-pub struct BatchReader {
-    schema: Arc<Schema>,
-    done: bool,
-}
-
-impl BatchReader {
-    fn new_empty(schema: Arc<Schema>) -> Self {
-        Self { schema, done: true }
-    }
-}
-
-impl Iterator for BatchReader {
-    type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
-    fn next(&mut self) -> Option<Self::Item> { None }
-}
-
-impl RecordBatchReader for BatchReader {
-    fn schema(&self) -> Arc<Schema> { self.schema.clone() }
 }
 
 // ---------------------------------------------------------------------------

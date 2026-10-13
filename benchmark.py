@@ -20,8 +20,7 @@ import datafusion
 import duckdb
 import pyarrow as pa
 
-GO_DRIVER_PATH = os.path.join(os.path.dirname(__file__), "build", "libadbc_driver_iceberg_go.so")
-RUST_DRIVER_PATH = os.path.join(os.path.dirname(__file__), "build", "libadbc_driver_iceberg_rust.so")
+DRIVER_PATH = os.path.join(os.path.dirname(__file__), "build", "libadbc_driver_iceberg_rust.so")
 
 CATALOG_URI = "http://localhost:8181"
 S3_ENDPOINT = "http://localhost:9000"
@@ -37,6 +36,8 @@ ADBC_DB_KWARGS = {
     "adbc.iceberg.s3.region": S3_REGION,
     "adbc.iceberg.s3.access_key": S3_ACCESS_KEY,
     "adbc.iceberg.s3.secret_key": S3_SECRET_KEY,
+    # MinIO needs path-style URLs
+    "adbc.iceberg.s3.path_style_access": "true",
 }
 
 
@@ -51,9 +52,9 @@ def timed(fn):
     return result, time.perf_counter() - t0
 
 
-def adbc_conn(driver_path=GO_DRIVER_PATH):
+def adbc_conn():
     return adbc_driver_manager.dbapi.connect(
-        driver=driver_path,
+        driver=DRIVER_PATH,
         entrypoint="AdbcDriverIcebergInit",
         db_kwargs=ADBC_DB_KWARGS,
     )
@@ -88,9 +89,9 @@ def duckdb_iceberg(query: str) -> tuple[pa.Table, float]:
     return result, elapsed
 
 
-def adbc_iceberg_go(query: str) -> tuple[pa.Table, float]:
-    """ADBC Iceberg driver (Go) directly."""
-    conn = adbc_conn(GO_DRIVER_PATH)
+def adbc_iceberg(query: str) -> tuple[pa.Table, float]:
+    """ADBC Iceberg driver directly."""
+    conn = adbc_conn()
     try:
         with conn.cursor() as cur:
             result, elapsed = timed(lambda: (cur.execute(query), cur.fetch_arrow_table())[1])
@@ -99,24 +100,13 @@ def adbc_iceberg_go(query: str) -> tuple[pa.Table, float]:
     return result, elapsed
 
 
-def adbc_iceberg_rust(query: str) -> tuple[pa.Table, float]:
-    """ADBC Iceberg driver (Rust) directly."""
-    conn = adbc_conn(RUST_DRIVER_PATH)
-    try:
-        with conn.cursor() as cur:
-            result, elapsed = timed(lambda: (cur.execute(query), cur.fetch_arrow_table())[1])
-    finally:
-        conn.close()
-    return result, elapsed
-
-
-def _duckdb_adbc_scan(query: str, driver_path: str) -> tuple[pa.Table, float]:
-    """DuckDB consuming an ADBC Iceberg driver via adbc_scan()."""
+def duckdb_adbc_scan(query: str) -> tuple[pa.Table, float]:
+    """DuckDB consuming the ADBC Iceberg driver via adbc_scan()."""
     con = duckdb.connect()
     con.execute("LOAD adbc_scanner")
     handle = con.execute(
         "SELECT adbc_connect($1)",
-        [{"driver": driver_path, "entrypoint": "AdbcDriverIcebergInit", **ADBC_DB_KWARGS}],
+        [{"driver": DRIVER_PATH, "entrypoint": "AdbcDriverIcebergInit", **ADBC_DB_KWARGS}],
     ).fetchone()[0]
     escaped = query.replace("'", "''")
     result, elapsed = timed(
@@ -129,17 +119,9 @@ def _duckdb_adbc_scan(query: str, driver_path: str) -> tuple[pa.Table, float]:
     return result, elapsed
 
 
-def duckdb_adbc_scan_go(query: str) -> tuple[pa.Table, float]:
-    return _duckdb_adbc_scan(query, GO_DRIVER_PATH)
-
-
-def duckdb_adbc_scan_rust(query: str) -> tuple[pa.Table, float]:
-    return _duckdb_adbc_scan(query, RUST_DRIVER_PATH)
-
-
 def datafusion_adbc(query: str) -> tuple[pa.Table, float]:
-    """DataFusion consuming ADBC Iceberg driver's (Go) Arrow batches (zero-copy)."""
-    conn = adbc_conn(GO_DRIVER_PATH)
+    """DataFusion consuming the ADBC Iceberg driver's Arrow batches (zero-copy)."""
+    conn = adbc_conn()
     try:
 
         def run():
@@ -156,10 +138,10 @@ def datafusion_adbc(query: str) -> tuple[pa.Table, float]:
     return result, elapsed
 
 
-def adbc_partitioned(query: str, driver_path: str = GO_DRIVER_PATH) -> tuple[pa.Table, float, float, int]:
+def adbc_partitioned(query: str) -> tuple[pa.Table, float, float, int]:
     """ADBC ExecutePartitions + ReadPartition (simulated distributed scan)."""
     db = adbc_driver_manager.AdbcDatabase(
-        driver=driver_path, entrypoint="AdbcDriverIcebergInit", **ADBC_DB_KWARGS,
+        driver=DRIVER_PATH, entrypoint="AdbcDriverIcebergInit", **ADBC_DB_KWARGS,
     )
     conn = adbc_driver_manager.AdbcConnection(db)
     stmt = adbc_driver_manager.AdbcStatement(conn)
@@ -287,12 +269,10 @@ def _build_pyiceberg_filter(filter_str: str):
 
 ENGINES = [
     ("DuckDB Iceberg", duckdb_iceberg),
-    ("ADBC Iceberg (Go)", adbc_iceberg_go),
-    ("ADBC Iceberg (Rust)", adbc_iceberg_rust),
+    ("ADBC Iceberg", adbc_iceberg),
     ("PyIceberg", pyiceberg_scan),
-    ("DuckDB adbc_scan() Go", duckdb_adbc_scan_go),
-    ("DuckDB adbc_scan() Rust", duckdb_adbc_scan_rust),
-    ("DataFusion + ADBC Go", datafusion_adbc),
+    ("DuckDB adbc_scan()", duckdb_adbc_scan),
+    ("DataFusion + ADBC", datafusion_adbc),
 ]
 
 
@@ -309,11 +289,10 @@ def run_benchmark(label: str, query: str, include_partitioned: bool = False):
         print(f"  {elapsed:.4f}s  {table.num_rows:>12,} rows  {name}")
 
     if include_partitioned:
-        for label, path in [("Go", GO_DRIVER_PATH), ("Rust", RUST_DRIVER_PATH)]:
-            table, elapsed, plan_time, num_parts = adbc_partitioned(query, path)
-            name = f"Partitioned {label} ({num_parts}x)"
-            results[name] = (table.num_rows, elapsed)
-            print(f"  {elapsed:.4f}s  {table.num_rows:>12,} rows  {name}  (plan: {plan_time:.4f}s)")
+        table, elapsed, plan_time, num_parts = adbc_partitioned(query)
+        name = f"Partitioned ({num_parts}x)"
+        results[name] = (table.num_rows, elapsed)
+        print(f"  {elapsed:.4f}s  {table.num_rows:>12,} rows  {name}  (plan: {plan_time:.4f}s)")
 
     return results
 
