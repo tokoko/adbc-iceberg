@@ -25,6 +25,7 @@ use iceberg_catalog_rest::RestCatalogBuilder;
 use iceberg_storage_opendal::OpenDalStorageFactory;
 
 mod sqlparser;
+mod substrait;
 
 use serde::{Deserialize, Serialize};
 
@@ -346,7 +347,7 @@ impl Connection for IcebergConnection {
             runtime: self.runtime.clone(),
             catalog: self.catalog.clone(),
             current_db_schema: self.current_db_schema.clone(),
-            sql_query: None,
+            query: None,
             scan_opts: ScanOptions::default(),
         })
     }
@@ -572,31 +573,51 @@ pub struct IcebergStatement {
     runtime: Arc<Runtime>,
     catalog: Arc<dyn Catalog>,
     current_db_schema: Arc<RwLock<Option<String>>>,
-    sql_query: Option<String>,
+    query: Option<Query>,
     scan_opts: ScanOptions,
+}
+
+/// The query set on a statement.
+enum Query {
+    Sql(String),
+    /// A Substrait plan, already translated.
+    Plan(ScanRequest),
+}
+
+/// What a query scans, whether it was given as SQL or as a Substrait plan.
+#[derive(Clone)]
+pub(crate) struct ScanRequest {
+    /// The namespace, if the query names one.
+    pub(crate) namespace: Option<String>,
+    pub(crate) table: String,
+    /// The columns to read, in output order. `None` reads every column.
+    pub(crate) columns: Option<Vec<String>>,
+    pub(crate) filter: Option<Predicate>,
 }
 
 /// A query resolved to its table and the snapshot it will read.
 struct ResolvedQuery {
-    parsed: sqlparser::SelectStatement,
+    request: ScanRequest,
     namespace: String,
     table: Table,
     snapshot_id: Option<i64>,
 }
 
 impl IcebergStatement {
-    fn query(&self) -> Result<&str> {
-        self.sql_query
-            .as_deref()
-            .ok_or_else(|| Error::with_message_and_status("no query set", Status::InvalidState))
+    fn request(&self) -> Result<ScanRequest> {
+        match &self.query {
+            Some(Query::Sql(sql)) => parse_query(sql),
+            Some(Query::Plan(request)) => Ok(request.clone()),
+            None => Err(Error::with_message_and_status("no query set", Status::InvalidState)),
+        }
     }
 
     fn resolve(&self) -> Result<ResolvedQuery> {
-        let parsed = parse_query(self.query()?)?;
-        let namespace = resolve_namespace(parsed.schema.as_deref(), &self.current_db_schema);
-        let table = load_table(&self.runtime, self.catalog.as_ref(), &namespace, &parsed.table)?;
+        let request = self.request()?;
+        let namespace = resolve_namespace(request.namespace.as_deref(), &self.current_db_schema);
+        let table = load_table(&self.runtime, self.catalog.as_ref(), &namespace, &request.table)?;
         let snapshot_id = self.scan_opts.resolve_snapshot(&table)?;
-        Ok(ResolvedQuery { parsed, namespace, table, snapshot_id })
+        Ok(ResolvedQuery { request, namespace, table, snapshot_id })
     }
 }
 
@@ -607,8 +628,14 @@ fn resolve_namespace(explicit: Option<&str>, current: &RwLock<Option<String>>) -
     }
 }
 
-fn parse_query(query: &str) -> Result<sqlparser::SelectStatement> {
-    sqlparser::parse(query).map_err(|e| invalid_arg(format!("unsupported SQL: {e}")))
+fn parse_query(query: &str) -> Result<ScanRequest> {
+    let parsed = sqlparser::parse(query).map_err(|e| invalid_arg(format!("unsupported SQL: {e}")))?;
+    Ok(ScanRequest {
+        namespace: parsed.schema,
+        table: parsed.table,
+        columns: (!parsed.select_all).then_some(parsed.columns),
+        filter: parsed.where_clause.as_ref().map(convert_predicate).transpose()?,
+    })
 }
 
 fn load_table(runtime: &Runtime, catalog: &dyn Catalog, namespace: &str, table_name: &str) -> Result<Table> {
@@ -617,44 +644,40 @@ fn load_table(runtime: &Runtime, catalog: &dyn Catalog, namespace: &str, table_n
     runtime.block_on(catalog.load_table(&ident)).map_err(iceberg_err)
 }
 
-/// Build a scan for the parsed query at the given snapshot.
-fn build_scan(table: &Table, parsed: &sqlparser::SelectStatement, snapshot_id: Option<i64>, batch_size: Option<usize>) -> Result<TableScan> {
+/// Build a scan for the request at the given snapshot.
+fn build_scan(table: &Table, request: &ScanRequest, snapshot_id: Option<i64>, batch_size: Option<usize>) -> Result<TableScan> {
     let mut builder = table.scan().with_batch_size(batch_size);
     if let Some(id) = snapshot_id {
         builder = builder.snapshot_id(id);
     }
-    if !parsed.select_all {
-        builder = builder.select(parsed.columns.iter().map(|s| s.as_str()));
+    if let Some(columns) = &request.columns {
+        builder = builder.select(columns.iter().map(|s| s.as_str()));
     }
-    if let Some(ref where_expr) = parsed.where_clause {
-        if let Ok(pred) = convert_predicate(where_expr) {
-            builder = builder.with_filter(pred);
-        }
+    if let Some(filter) = &request.filter {
+        builder = builder.with_filter(filter.clone());
     }
     builder.build().map_err(iceberg_err)
 }
 
 /// The Arrow schema a query produces: the snapshot's table schema with the
 /// query's projection applied.
-fn output_schema(table: &Table, snapshot_id: Option<i64>, parsed: &sqlparser::SelectStatement) -> Result<Schema> {
+fn output_schema(table: &Table, snapshot_id: Option<i64>, request: &ScanRequest) -> Result<Schema> {
     let metadata = table.metadata();
     let iceberg_schema = match snapshot_id.and_then(|id| metadata.snapshot_by_id(id)) {
         Some(snapshot) => snapshot.schema(metadata).map_err(iceberg_err)?,
         None => metadata.current_schema().clone(),
     };
     let schema = iceberg::arrow::schema_to_arrow_schema(&iceberg_schema).map_err(iceberg_err)?;
-    if parsed.select_all {
+    let Some(columns) = &request.columns else {
         return Ok(schema);
-    }
-    let indices = parsed
-        .columns
+    };
+    let indices = columns
         .iter()
         .map(|c| schema.index_of(c).map_err(|_| invalid_arg(format!("column '{c}' not found"))))
         .collect::<Result<Vec<_>>>()?;
     Ok(schema.project(&indices)?)
 }
 
-/// Convert parsed WHERE AST to iceberg Predicate.
 /// The Arrow schema a planned task produces: the task's snapshot schema with
 /// its projected fields, in projection order.
 fn task_output_schema(task: &FileScanTask) -> Result<Schema> {
@@ -675,6 +698,7 @@ fn task_output_schema(task: &FileScanTask) -> Result<Schema> {
     Ok(schema.project(&indices)?)
 }
 
+/// Convert parsed WHERE AST to iceberg Predicate.
 fn convert_predicate(expr: &sqlparser::Expr) -> Result<Predicate> {
     match expr {
         sqlparser::Expr::Binary { column, op, value } => {
@@ -780,14 +804,14 @@ impl Optionable for IcebergStatement {
 
 impl Statement for IcebergStatement {
     fn set_sql_query(&mut self, query: impl AsRef<str>) -> Result<()> {
-        self.sql_query = Some(query.as_ref().to_string());
+        self.query = Some(Query::Sql(query.as_ref().to_string()));
         Ok(())
     }
 
     fn execute(&mut self) -> Result<Box<dyn RecordBatchReader + Send>> {
         let q = self.resolve()?;
-        let schema = output_schema(&q.table, q.snapshot_id, &q.parsed)?;
-        let scan = build_scan(&q.table, &q.parsed, q.snapshot_id, self.scan_opts.batch_size)?;
+        let schema = output_schema(&q.table, q.snapshot_id, &q.request)?;
+        let scan = build_scan(&q.table, &q.request, q.snapshot_id, self.scan_opts.batch_size)?;
 
         // Only plan here; batches are read lazily by the reader.
         let stream = self.runtime.block_on(scan.to_arrow()).map_err(iceberg_err)?;
@@ -800,13 +824,13 @@ impl Statement for IcebergStatement {
 
     fn execute_schema(&mut self) -> Result<Schema> {
         let q = self.resolve()?;
-        output_schema(&q.table, q.snapshot_id, &q.parsed)
+        output_schema(&q.table, q.snapshot_id, &q.request)
     }
 
     fn execute_partitions(&mut self) -> Result<adbc_core::PartitionedResult> {
         let q = self.resolve()?;
-        let schema = output_schema(&q.table, q.snapshot_id, &q.parsed)?;
-        let scan = build_scan(&q.table, &q.parsed, q.snapshot_id, self.scan_opts.batch_size)?;
+        let schema = output_schema(&q.table, q.snapshot_id, &q.request)?;
+        let scan = build_scan(&q.table, &q.request, q.snapshot_id, self.scan_opts.batch_size)?;
 
         let tasks: Vec<FileScanTask> = self.runtime.block_on(async {
             use futures::TryStreamExt;
@@ -823,7 +847,7 @@ impl Statement for IcebergStatement {
             .map(|task| {
                 let descriptor = PartitionDescriptor {
                     namespace: q.namespace.clone(),
-                    table_name: q.parsed.table.clone(),
+                    table_name: q.request.table.clone(),
                     task,
                     batch_size: self.scan_opts.batch_size,
                 };
@@ -843,8 +867,11 @@ impl Statement for IcebergStatement {
         Err(ErrorHelper::not_implemented().message("get_parameter_schema").to_adbc())
     }
     fn prepare(&mut self) -> Result<()> { Ok(()) }
-    fn set_substrait_plan(&mut self, _plan: impl AsRef<[u8]>) -> Result<()> {
-        Err(ErrorHelper::not_implemented().message("set_substrait_plan").to_adbc())
+    fn set_substrait_plan(&mut self, plan: impl AsRef<[u8]>) -> Result<()> {
+        let request = substrait::parse(plan.as_ref())
+            .map_err(|e| invalid_arg(format!("unsupported Substrait plan: {e}")))?;
+        self.query = Some(Query::Plan(request));
+        Ok(())
     }
     fn bind(&mut self, _batch: RecordBatch) -> Result<()> {
         Err(ErrorHelper::not_implemented().message("bind").to_adbc())

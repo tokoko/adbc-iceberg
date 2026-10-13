@@ -20,6 +20,12 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+prost = "0.14"
+# protox compiles the Substrait protos in-process, so the build needs no protoc.
+substrait-prost = { version = "0.102", features = ["protox"] }
+
+# Used only by the benchmarks in examples/.
+[dev-dependencies]
 opendal = { version = "0.58", features = ["services-s3"] }
 object_store = { version = "0.12", features = ["aws"] }
 parquet = { version = "55", features = ["async", "object_store"] }

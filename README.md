@@ -13,6 +13,7 @@ The idea: instead of each engine (DuckDB, DataFusion, Spark, etc.) implementing 
 | S3 client | opendal |
 | ADBC framework | [adbc_core](https://crates.io/crates/adbc_core) + [adbc_ffi](https://crates.io/crates/adbc_ffi) |
 | Catalog support | REST (+ Glue, HMS, SQL, S3 Tables available via iceberg-rust) |
+| Query input | Restricted SQL or a Substrait plan |
 | Column projection | Yes |
 | Predicate pushdown | Row group stats + page index + row filter |
 | Partitioned execution | One partition per data file; each reads only its assigned file |
@@ -170,6 +171,35 @@ SELECT <columns | *> FROM [schema.]<table> [WHERE <filter>]
 
 Supported WHERE operators: `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `IS NULL`, `IS NOT NULL`, `AND`, `OR`, `NOT`, parentheses.
 
+## Substrait Support
+
+A statement also accepts a serialized [Substrait](https://substrait.io/) `Plan` in place of SQL
+(`AdbcStatementSetSubstraitPlan`; from Python, pass `bytes` to `cursor.execute`). The plan must
+reduce to a single table scan:
+
+- **Relations**: a `ReadRel` on a named table, optionally under `FilterRel` and `ProjectRel` nodes.
+  A projection may only pick columns. Anything else (fetch, sort, aggregate, join) is rejected.
+- **Table name**: the last name is the table and the names before it are the namespace; a single
+  name uses the connection's current db_schema.
+- **Filters**: `and`, `or`, `not`, `equal`, `not_equal`, `lt`, `lte`, `gt`, `gte`, `is_null`,
+  `is_not_null`, `is_nan`, `between`, `starts_with`, `like` with a prefix pattern (`'abc%'`), and
+  `IN` lists. Comparisons are between a top-level column and a literal.
+- **Literals**: boolean, integers, floats, strings, binary, date, time, timestamp (with or without
+  time zone), decimal and UUID.
+
+A plan the driver cannot translate exactly is rejected with an error instead of being run with a
+weaker filter. The one exception is `ReadRel.best_effort_filter`, which is dropped if it cannot be
+translated. Column renames in the plan root are not supported.
+
+```python
+from datafusion import SessionContext, substrait
+
+plan = substrait.Serde.serialize_bytes("SELECT id, name FROM my_table WHERE id < 100", ctx)
+with conn.cursor() as cur:
+    cur.execute(plan)
+    table = cur.fetch_arrow_table()
+```
+
 ## Benchmarks
 
 5,000,000 rows across 5 Parquet files, unpartitioned table, reading from a local REST catalog + MinIO. Median of five runs. PyIceberg is included as a baseline; it reads through PyArrow's C++ Parquet reader and S3 client, not iceberg-rust, so it shares no reader code with the driver.
@@ -229,6 +259,7 @@ Iceberg REST Catalog ──► S3 / GCS / Azure
 ├── rust/                   # Rust driver
 │   ├── src/lib.rs          # Driver, Database, Connection, Statement
 │   ├── src/sqlparser.rs    # Restricted SQL parser
+│   ├── src/substrait.rs    # Substrait plan translation
 │   ├── examples/           # Direct benchmarks (no ADBC)
 │   └── Cargo.toml
 ├── docker-compose.yml      # Local REST catalog + MinIO
